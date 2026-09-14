@@ -68,11 +68,12 @@ def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
     return len(df)
 
 
-def fetch_live_prices(period: str = "2y", interval: str = "1wk") -> pd.DataFrame:
-    """Hämtar senaste BTC-USD-priser från Yahoo Finance (samma schema som CSV-datan)."""
+def fetch_live_prices(start: str = "2014-01-01", interval: str = "1wk") -> pd.DataFrame:
+    """Hämtar BTC-USD-priser från Yahoo Finance från och med `start` till idag
+    (samma schema som CSV-datan)."""
     import yfinance as yf
 
-    raw = yf.download("BTC-USD", period=period, interval=interval, progress=False, auto_adjust=False)
+    raw = yf.download("BTC-USD", start=start, interval=interval, progress=False, auto_adjust=False)
     if raw.empty:
         return pd.DataFrame(columns=["date", "price", "pct_change"])
 
@@ -87,10 +88,11 @@ def fetch_live_prices(period: str = "2y", interval: str = "1wk") -> pd.DataFrame
     return df.dropna(subset=["price"])
 
 
-def ingest_live(db_path: Path = DB_PATH, period: str = "2y", interval: str = "1wk") -> int:
-    """Hämtar aktuell data från Yahoo Finance och skriver in den i databasen (kompletterar/uppdaterar,
-    skriver inte över den historiska CSV-datan). Returnerar antal rader som hämtades."""
-    df = fetch_live_prices(period=period, interval=interval)
+def ingest_live(db_path: Path = DB_PATH, start: str = "2014-01-01", interval: str = "1wk") -> int:
+    """Hämtar data från Yahoo Finance (från `start` till idag) och skriver in den i
+    databasen (kompletterar/uppdaterar, skriver inte över den historiska CSV-datan).
+    Returnerar antal rader som hämtades."""
+    df = fetch_live_prices(start=start, interval=interval)
     if df.empty:
         return 0
 
