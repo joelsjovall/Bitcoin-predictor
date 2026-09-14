@@ -36,15 +36,60 @@ def load_csv(csv_path: Path = CSV_PATH) -> pd.DataFrame:
 
 def init_db(db_path: Path = DB_PATH) -> None:
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS prices (
+    schema_sql = """
+        CREATE TABLE prices (
             date TEXT PRIMARY KEY,
             price REAL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume REAL,
             pct_change REAL
         )
         """
-    )
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prices'"
+    ).fetchone()
+
+    if not table_exists:
+        conn.execute(schema_sql)
+
+    table_info = conn.execute("PRAGMA table_info(prices)").fetchall()
+    has_date_primary_key = any(row[1] == "date" and row[5] for row in table_info)
+    if table_info and not has_date_primary_key:
+        conn.execute("ALTER TABLE prices RENAME TO prices_old")
+        conn.execute(schema_sql)
+
+        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
+        copy_columns = [
+            column
+            for column in ["date", "price", "open", "high", "low", "close", "volume", "pct_change"]
+            if column in old_columns
+        ]
+        if copy_columns:
+            columns_sql = ", ".join(copy_columns)
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO prices ({columns_sql})
+                SELECT {columns_sql}
+                FROM prices_old
+                WHERE date IS NOT NULL
+                """
+            )
+        conn.execute("DROP TABLE prices_old")
+        table_info = conn.execute("PRAGMA table_info(prices)").fetchall()
+
+    existing_columns = {row[1] for row in table_info}
+    for column_name, column_type in {
+        "open": "REAL",
+        "high": "REAL",
+        "low": "REAL",
+        "close": "REAL",
+        "volume": "REAL",
+    }.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE prices ADD COLUMN {column_name} {column_type}")
     conn.commit()
     conn.close()
 
@@ -98,12 +143,18 @@ def ingest_live(db_path: Path = DB_PATH, period: str = "2y", interval: str = "1w
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
-    rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
+    rows = (
+        df.assign(date=df["date"].dt.strftime("%Y-%m-%d"), price=df["close"])[
+            ["date", "price", "open", "high", "low", "close", "volume", "pct_change"]
+        ]
+        .to_dict("records")
+    )
     conn.executemany(
         """
-        INSERT INTO prices (date, open, high, low, close, volume, pct_change)
-        VALUES (:date, :open, :high, :low, :close, :volume, :pct_change)
+        INSERT INTO prices (date, price, open, high, low, close, volume, pct_change)
+        VALUES (:date, :price, :open, :high, :low, :close, :volume, :pct_change)
         ON CONFLICT(date) DO UPDATE SET
+            price=excluded.price,
             open=excluded.open, high=excluded.high, low=excluded.low,
             close=excluded.close, volume=excluded.volume, pct_change=excluded.pct_change
         """,
