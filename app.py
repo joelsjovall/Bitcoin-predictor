@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import ingest_csv, load_prices_df
-from model import build_features, predict_next_price, train_model
+from model import METHODS, build_features, predict_next_price, train_model
 
 st.set_page_config(page_title="Bitcoin – pris & prognos", layout="wide")
 st.title("Bitcoin – historik och prognos")
@@ -18,6 +18,14 @@ with st.sidebar:
     if st.button("Träna om modellen"):
         st.cache_resource.clear()
 
+method = st.segmented_control(
+    "AI-metod",
+    options=list(METHODS.keys()),
+    default="Random Forest",
+)
+if method is None:
+    method = "Random Forest"
+
 
 @st.cache_data
 def get_data() -> pd.DataFrame:
@@ -25,12 +33,12 @@ def get_data() -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_model_and_metrics():
-    return train_model(get_data())
+def get_model_and_metrics(selected_method: str):
+    return train_model(get_data(), method=selected_method)
 
 
 df = get_data()
-model, metrics = get_model_and_metrics()
+model, metrics = get_model_and_metrics(method)
 next_price = predict_next_price(df, model)
 last_row = df.iloc[-1]
 change_pct = (next_price - last_row["price"]) / last_row["price"] * 100
@@ -40,7 +48,7 @@ col1.metric("Senaste pris", f"{last_row['price']:,.0f}", help=str(last_row["date
 col2.metric("Prognos nästa vecka", f"{next_price:,.0f}", f"{change_pct:+.1f}%")
 col3.metric("Modellens MAE (test)", f"{metrics['mae']:,.0f}", f"naiv: {metrics['naive_mae']:,.0f}")
 
-st.subheader("Prishistorik")
+st.subheader(f"Prishistorik – {method}")
 feat = build_features(df)
 forecast_date = last_row["date"] + pd.Timedelta(weeks=1)
 
@@ -67,7 +75,7 @@ st.dataframe(
 with st.expander("Om modellen"):
     st.write(
         f"""
-        En RandomForestRegressor tränad på {metrics['n_train']} veckor och testad på
+        **{method}** tränad på {metrics['n_train']} veckor och testad på
         {metrics['n_test']} veckor (senaste delen av tidsserien).
 
         - MAE: {metrics['mae']:.1f} (naiv baseline, dvs. "nästa vecka = samma som denna": {metrics['naive_mae']:.1f})

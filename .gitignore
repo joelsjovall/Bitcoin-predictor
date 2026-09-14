@@ -3,5 +3,5 @@ __pycache__/
 .venv/
 venv/
 bitcoin.db
-model.pkl
+model_*.pkl
 .streamlit/

@@ -1,15 +1,20 @@
-"""AI-modellering: förutspår nästa veckas pris (regression)."""
+"""AI-modellering: förutspår nästa veckas pris med olika metoder (regression)."""
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
 
 from db import load_prices_df
 
-MODEL_PATH = Path(__file__).parent / "model.pkl"
+MODEL_DIR = Path(__file__).parent
 
 FEATURE_COLUMNS = [
     "pct_change",
@@ -19,6 +24,25 @@ FEATURE_COLUMNS = [
     "rolling_mean_return_4",
     "rolling_std_return_4",
 ]
+
+# Alla metoder tränas på samma features/target, se build_features(). Features skalas
+# (StandardScaler) eftersom SVR och linjär regression är känsliga för det, medan det är
+# harmlöst för de trädbaserade metoderna.
+METHODS = {
+    "Linjär regression": lambda: make_pipeline(StandardScaler(), LinearRegression()),
+    "SVR": lambda: make_pipeline(StandardScaler(), SVR(kernel="rbf", C=10, epsilon=0.01)),
+    "Random Forest": lambda: make_pipeline(
+        StandardScaler(), RandomForestRegressor(n_estimators=300, random_state=42)
+    ),
+    "XGBoost": lambda: make_pipeline(
+        StandardScaler(), XGBRegressor(n_estimators=300, random_state=42)
+    ),
+}
+
+
+def _model_path(method: str) -> Path:
+    slug = method.lower().replace(" ", "_").replace("ä", "a").replace("ö", "o")
+    return MODEL_DIR / f"model_{slug}.pkl"
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -40,7 +64,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def train_model(df: pd.DataFrame | None = None, test_size: float = 0.2):
+def train_model(df: pd.DataFrame | None = None, method: str = "Random Forest", test_size: float = 0.2):
+    if method not in METHODS:
+        raise ValueError(f"Okänd metod: {method}. Välj bland {list(METHODS)}")
     if df is None:
         df = load_prices_df()
 
@@ -52,7 +78,7 @@ def train_model(df: pd.DataFrame | None = None, test_size: float = 0.2):
     X_train, y_train = train[FEATURE_COLUMNS], train["target_return"]
     X_test, y_test = test[FEATURE_COLUMNS], test["target_return"]
 
-    model = RandomForestRegressor(n_estimators=300, random_state=42)
+    model = METHODS[method]()
     model.fit(X_train, y_train)
 
     pred_return = model.predict(X_test)
@@ -61,6 +87,7 @@ def train_model(df: pd.DataFrame | None = None, test_size: float = 0.2):
     naive_price = test["price"].values  # baseline: nästa vecka = samma som denna vecka
 
     metrics = {
+        "method": method,
         "mae": mean_absolute_error(actual_price, pred_price),
         "rmse": np.sqrt(mean_squared_error(actual_price, pred_price)),
         "r2": r2_score(actual_price, pred_price),
@@ -70,21 +97,22 @@ def train_model(df: pd.DataFrame | None = None, test_size: float = 0.2):
         "n_test": len(test),
     }
 
-    joblib.dump(model, MODEL_PATH)
+    joblib.dump(model, _model_path(method))
     return model, metrics
 
 
-def load_model():
-    if not MODEL_PATH.exists():
-        return train_model()[0]
-    return joblib.load(MODEL_PATH)
+def load_model(method: str = "Random Forest"):
+    path = _model_path(method)
+    if not path.exists():
+        return train_model(method=method)[0]
+    return joblib.load(path)
 
 
-def predict_next_price(df: pd.DataFrame | None = None, model=None) -> float:
+def predict_next_price(df: pd.DataFrame | None = None, model=None, method: str = "Random Forest") -> float:
     if df is None:
         df = load_prices_df()
     if model is None:
-        model = load_model()
+        model = load_model(method)
 
     feat = build_features(df)
     latest = feat.iloc[[-1]]
@@ -93,10 +121,10 @@ def predict_next_price(df: pd.DataFrame | None = None, model=None) -> float:
 
 
 if __name__ == "__main__":
-    trained_model, m = train_model()
-    print("Modell tränad. Utvärdering på testperioden:")
-    print(f"  MAE:  {m['mae']:.2f}  (naiv baseline: {m['naive_mae']:.2f})")
-    print(f"  RMSE: {m['rmse']:.2f}  (naiv baseline: {m['naive_rmse']:.2f})")
-    print(f"  R2:   {m['r2']:.3f}")
-    print(f"  Tränad på {m['n_train']} veckor, testad på {m['n_test']} veckor")
-    print(f"Prognos nästa vecka: {predict_next_price(model=trained_model):.1f}")
+    for method_name in METHODS:
+        trained_model, m = train_model(method=method_name)
+        print(f"--- {method_name} ---")
+        print(f"  MAE:  {m['mae']:.2f}  (naiv baseline: {m['naive_mae']:.2f})")
+        print(f"  RMSE: {m['rmse']:.2f}  (naiv baseline: {m['naive_rmse']:.2f})")
+        print(f"  R2:   {m['r2']:.3f}")
+        print(f"  Prognos nästa vecka: {predict_next_price(model=trained_model):.1f}")
