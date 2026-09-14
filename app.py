@@ -43,10 +43,22 @@ next_price = predict_next_price(df, model)
 last_row = df.iloc[-1]
 change_pct = (next_price - last_row["price"]) / last_row["price"] * 100
 
+all_metrics = {m: get_model_and_metrics(m)[1] for m in METHODS}
+best_method = min(all_metrics, key=lambda m: all_metrics[m]["rmse"])
+best_rmse = all_metrics[best_method]["rmse"]
+
+if method == best_method:
+    st.success(f"🏆 **{method}** är just nu bästa metoden (lägst RMSE: {best_rmse:,.0f})")
+else:
+    st.info(
+        f"🏆 Bästa metoden just nu är **{best_method}** "
+        f"(RMSE {best_rmse:,.0f} mot {metrics['rmse']:,.0f} för {method})"
+    )
+
 col1, col2, col3 = st.columns(3)
 col1.metric("Senaste pris", f"{last_row['price']:,.0f}", help=str(last_row["date"].date()))
 col2.metric("Prognos nästa vecka", f"{next_price:,.0f}", f"{change_pct:+.1f}%")
-col3.metric("Modellens MAE (test)", f"{metrics['mae']:,.0f}", f"naiv: {metrics['naive_mae']:,.0f}")
+col3.metric("Modellens RMSE (test)", f"{metrics['rmse']:,.0f}", f"naiv: {metrics['naive_rmse']:,.0f}")
 
 st.subheader(f"Prishistorik – {method}")
 feat = build_features(df)
@@ -64,12 +76,12 @@ fig.add_trace(
     )
 )
 fig.update_layout(xaxis_title="Datum", yaxis_title="Pris (USD)", height=500)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 st.subheader("Senaste veckorna")
 st.dataframe(
     df.sort_values("date", ascending=False).head(10).set_index("date"),
-    use_container_width=True,
+    width="stretch",
 )
 
 with st.expander("Om modellen"):
@@ -86,3 +98,9 @@ with st.expander("Om modellen"):
         är det viktiga, inte modellens exakta träffsäkerhet.
         """
     )
+
+    st.write("**Jämförelse mellan metoder (test-RMSE, lägre är bättre):**")
+    comparison = pd.DataFrame(
+        [{"Metod": m, "RMSE": all_metrics[m]["rmse"], "MAE": all_metrics[m]["mae"]} for m in METHODS]
+    ).sort_values("RMSE")
+    st.dataframe(comparison.set_index("Metod"), width="stretch")
