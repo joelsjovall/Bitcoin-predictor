@@ -18,7 +18,6 @@ FEATURE_COLUMNS = [
     "ret_lag_3",
     "rolling_mean_return_4",
     "rolling_std_return_4",
-    "volume_ratio_4",
 ]
 
 
@@ -36,7 +35,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["ret_lag_3"] = ret.shift(3)
     out["rolling_mean_return_4"] = ret.shift(1).rolling(4).mean()
     out["rolling_std_return_4"] = ret.shift(1).rolling(4).std()
-    out["volume_ratio_4"] = out["volume"] / out["volume"].shift(1).rolling(4).mean()
     out["target_return"] = out["close"].shift(-1) / out["close"] - 1
     out["target_next_close"] = out["close"].shift(-1)
     return out
