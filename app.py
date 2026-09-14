@@ -75,7 +75,25 @@ fig.add_trace(
         line=dict(dash="dot", color="orange"),
     )
 )
-fig.update_layout(xaxis_title="Datum", yaxis_title="Pris (USD)", height=500)
+fig.update_layout(
+    xaxis_title="Datum",
+    yaxis_title="Pris (USD)",
+    height=550,
+    xaxis=dict(
+        type="date",
+        rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(count=1, label="1Å", step="year", stepmode="backward"),
+                dict(count=5, label="5Å", step="year", stepmode="backward"),
+                dict(step="all", label="Allt"),
+            ]
+        ),
+        rangeslider=dict(visible=True),
+    ),
+)
 st.plotly_chart(fig, width="stretch")
 
 st.subheader("Senaste veckorna")
