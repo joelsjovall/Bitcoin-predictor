@@ -23,15 +23,15 @@ def load_csv(csv_path: Path = CSV_PATH) -> pd.DataFrame:
     df = df.rename(
         columns={
             "Datum": "date",
-            "Senaste": "close",
+            "Senaste": "price",
             "+/- %": "pct_change",
         }
     )
     df["date"] = pd.to_datetime(df["date"])
-    df["close"] = df["close"].apply(_parse_number)
+    df["price"] = df["price"].apply(_parse_number)
     df["pct_change"] = df["pct_change"].apply(_parse_percent)
     df = df.sort_values("date").reset_index(drop=True)
-    return df[["date", "close", "pct_change"]]
+    return df[["date", "price", "pct_change"]]
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
@@ -40,7 +40,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         """
         CREATE TABLE IF NOT EXISTS prices (
             date TEXT PRIMARY KEY,
-            close REAL,
+            price REAL,
             pct_change REAL
         )
         """

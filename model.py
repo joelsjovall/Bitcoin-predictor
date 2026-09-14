@@ -1,4 +1,4 @@
-"""AI-modellering: förutspår nästa veckas stängningskurs (regression)."""
+"""AI-modellering: förutspår nästa veckas pris (regression)."""
 from pathlib import Path
 
 import joblib
@@ -29,14 +29,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     och target som relativa förändringar (avkastning) istället för absoluta prisnivåer.
     """
     out = df.copy().sort_values("date").reset_index(drop=True)
-    ret = out["close"].pct_change()
+    ret = out["price"].pct_change()
     out["ret_lag_1"] = ret.shift(1)
     out["ret_lag_2"] = ret.shift(2)
     out["ret_lag_3"] = ret.shift(3)
     out["rolling_mean_return_4"] = ret.shift(1).rolling(4).mean()
     out["rolling_std_return_4"] = ret.shift(1).rolling(4).std()
-    out["target_return"] = out["close"].shift(-1) / out["close"] - 1
-    out["target_next_close"] = out["close"].shift(-1)
+    out["target_return"] = out["price"].shift(-1) / out["price"] - 1
+    out["target_next_price"] = out["price"].shift(-1)
     return out
 
 
@@ -56,9 +56,9 @@ def train_model(df: pd.DataFrame | None = None, test_size: float = 0.2):
     model.fit(X_train, y_train)
 
     pred_return = model.predict(X_test)
-    pred_price = test["close"].values * (1 + pred_return)
-    actual_price = test["target_next_close"].values
-    naive_price = test["close"].values  # baseline: nästa vecka = samma som denna vecka
+    pred_price = test["price"].values * (1 + pred_return)
+    actual_price = test["target_next_price"].values
+    naive_price = test["price"].values  # baseline: nästa vecka = samma som denna vecka
 
     metrics = {
         "mae": mean_absolute_error(actual_price, pred_price),
@@ -80,7 +80,7 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 
-def predict_next_close(df: pd.DataFrame | None = None, model=None) -> float:
+def predict_next_price(df: pd.DataFrame | None = None, model=None) -> float:
     if df is None:
         df = load_prices_df()
     if model is None:
@@ -89,7 +89,7 @@ def predict_next_close(df: pd.DataFrame | None = None, model=None) -> float:
     feat = build_features(df)
     latest = feat.iloc[[-1]]
     pred_return = model.predict(latest[FEATURE_COLUMNS])[0]
-    return float(latest["close"].iloc[0] * (1 + pred_return))
+    return float(latest["price"].iloc[0] * (1 + pred_return))
 
 
 if __name__ == "__main__":
@@ -99,4 +99,4 @@ if __name__ == "__main__":
     print(f"  RMSE: {m['rmse']:.2f}  (naiv baseline: {m['naive_rmse']:.2f})")
     print(f"  R2:   {m['r2']:.3f}")
     print(f"  Tränad på {m['n_train']} veckor, testad på {m['n_test']} veckor")
-    print(f"Prognos nästa vecka: {predict_next_close(model=trained_model):.1f}")
+    print(f"Prognos nästa vecka: {predict_next_price(model=trained_model):.1f}")
