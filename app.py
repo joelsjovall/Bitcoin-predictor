@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from db import ingest_csv, load_prices_df
+from db import ingest_csv, ingest_live, load_prices_df
 from model import build_features, predict_next_close, train_model
 
 st.set_page_config(page_title="Bitcoin – pris & prognos", layout="wide")
@@ -15,6 +15,13 @@ with st.sidebar:
         n = ingest_csv()
         st.success(f"Laddade in {n} rader.")
         st.cache_data.clear()
+    if st.button("Hämta senaste data (live)"):
+        try:
+            n = ingest_live()
+            st.success(f"Hämtade/uppdaterade {n} rader från Yahoo Finance.")
+            st.cache_data.clear()
+        except Exception as e:
+            st.error(f"Kunde inte hämta live-data: {e}")
     if st.button("Träna om modellen"):
         st.cache_resource.clear()
 
