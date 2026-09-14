@@ -1,4 +1,4 @@
-"""AI-modellering: förutspår nästa veckas pris med olika metoder (regression)."""
+"""AI-modellering: förutspår priset ett antal veckor framåt (regression)."""
 from pathlib import Path
 
 import joblib
@@ -39,18 +39,32 @@ METHODS = {
     ),
 }
 
+FORECAST_HORIZONS = {
+    "1 månad": 4,
+    "3 månader": 13,
+    "6 månader": 26,
+    "1 år": 52,
+    "3 år": 156,
+    "5 år": 260,
+}
 
-def _model_path(method: str) -> Path:
+
+def _model_path(method: str, horizon_weeks: int) -> Path:
     slug = method.lower().replace(" ", "_").replace("ä", "a").replace("ö", "o")
-    return MODEL_DIR / f"model_{slug}.pkl"
+    return MODEL_DIR / f"model_{slug}_{horizon_weeks}w.pkl"
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Bygger features utifrån historiken. df måste vara sorterad på datum, äldst först.
+def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
+    """Bygger features och ett mål `horizon_weeks` veckor framåt.
 
-    Bitcoin-priset har vuxit exponentiellt (från ca 0,1 till 80 000+ USD), så absoluta
-    prisnivåer generaliserar dåligt mellan tränings- och testperiod. Därför byggs features
-    och target som relativa förändringar (avkastning) istället för absoluta prisnivåer.
+    df måste innehålla kolumnerna date, price, pct_change och vara sorterad äldst
+    först. Bitcoin-priset har vuxit exponentiellt (från ca 0,1 till 80 000+ USD), så
+    absoluta prisnivåer generaliserar dåligt mellan tränings- och testperiod. Därför
+    byggs features och mål som relativa förändringar (avkastning) istället.
+
+    Modellen tränas direkt mot horisonten (t.ex. "priset om 52 veckor"), inte genom
+    att kedja ihop upprepade enveckasprognoser – det senare får fel att ackumuleras
+    exponentiellt över långa horisonter.
     """
     out = df.copy().sort_values("date").reset_index(drop=True)
     ret = out["price"].pct_change()
@@ -59,18 +73,23 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["ret_lag_3"] = ret.shift(3)
     out["rolling_mean_return_4"] = ret.shift(1).rolling(4).mean()
     out["rolling_std_return_4"] = ret.shift(1).rolling(4).std()
-    out["target_return"] = out["price"].shift(-1) / out["price"] - 1
-    out["target_next_price"] = out["price"].shift(-1)
+    out["target_price"] = out["price"].shift(-horizon_weeks)
+    out["target_return"] = out["target_price"] / out["price"] - 1
     return out
 
 
-def train_model(df: pd.DataFrame | None = None, method: str = "Random Forest", test_size: float = 0.2):
+def train_model(
+    df: pd.DataFrame | None = None,
+    method: str = "Random Forest",
+    horizon_weeks: int = 1,
+    test_size: float = 0.2,
+):
     if method not in METHODS:
         raise ValueError(f"Okänd metod: {method}. Välj bland {list(METHODS)}")
     if df is None:
         df = load_prices_df()
 
-    feat = build_features(df).dropna(subset=FEATURE_COLUMNS + ["target_return"])
+    feat = build_features(df, horizon_weeks).dropna(subset=FEATURE_COLUMNS + ["target_return"])
 
     split_idx = int(len(feat) * (1 - test_size))
     train, test = feat.iloc[:split_idx], feat.iloc[split_idx:]
@@ -83,11 +102,12 @@ def train_model(df: pd.DataFrame | None = None, method: str = "Random Forest", t
 
     pred_return = model.predict(X_test)
     pred_price = test["price"].values * (1 + pred_return)
-    actual_price = test["target_next_price"].values
-    naive_price = test["price"].values  # baseline: nästa vecka = samma som denna vecka
+    actual_price = test["target_price"].values
+    naive_price = test["price"].values  # baseline: priset om N veckor = samma som nu
 
     metrics = {
         "method": method,
+        "horizon_weeks": horizon_weeks,
         "mae": mean_absolute_error(actual_price, pred_price),
         "rmse": np.sqrt(mean_squared_error(actual_price, pred_price)),
         "r2": r2_score(actual_price, pred_price),
@@ -97,34 +117,42 @@ def train_model(df: pd.DataFrame | None = None, method: str = "Random Forest", t
         "n_test": len(test),
     }
 
-    joblib.dump(model, _model_path(method))
+    joblib.dump(model, _model_path(method, horizon_weeks))
     return model, metrics
 
 
-def load_model(method: str = "Random Forest"):
-    path = _model_path(method)
+def load_model(method: str = "Random Forest", horizon_weeks: int = 1):
+    path = _model_path(method, horizon_weeks)
     if not path.exists():
-        return train_model(method=method)[0]
+        return train_model(method=method, horizon_weeks=horizon_weeks)[0]
     return joblib.load(path)
 
 
-def predict_next_price(df: pd.DataFrame | None = None, model=None, method: str = "Random Forest") -> float:
+def predict_price(
+    df: pd.DataFrame | None = None,
+    model=None,
+    method: str = "Random Forest",
+    horizon_weeks: int = 1,
+) -> float:
+    """Förutspår priset `horizon_weeks` veckor efter senaste kända datapunkten."""
     if df is None:
         df = load_prices_df()
     if model is None:
-        model = load_model(method)
+        model = load_model(method, horizon_weeks)
 
-    feat = build_features(df)
+    feat = build_features(df, horizon_weeks)
     latest = feat.iloc[[-1]]
     pred_return = model.predict(latest[FEATURE_COLUMNS])[0]
     return float(latest["price"].iloc[0] * (1 + pred_return))
 
 
 if __name__ == "__main__":
-    for method_name in METHODS:
-        trained_model, m = train_model(method=method_name)
-        print(f"--- {method_name} ---")
-        print(f"  MAE:  {m['mae']:.2f}  (naiv baseline: {m['naive_mae']:.2f})")
-        print(f"  RMSE: {m['rmse']:.2f}  (naiv baseline: {m['naive_rmse']:.2f})")
-        print(f"  R2:   {m['r2']:.3f}")
-        print(f"  Prognos nästa vecka: {predict_next_price(model=trained_model):.1f}")
+    for horizon_label, weeks in FORECAST_HORIZONS.items():
+        print(f"=== Horisont: {horizon_label} ({weeks} veckor) ===")
+        for method_name in METHODS:
+            trained_model, m = train_model(method=method_name, horizon_weeks=weeks)
+            price = predict_price(model=trained_model, horizon_weeks=weeks)
+            print(
+                f"  {method_name:20s} RMSE {m['rmse']:>12,.0f} "
+                f"(naiv {m['naive_rmse']:>12,.0f})  prognos: {price:>12,.0f}"
+            )
