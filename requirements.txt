@@ -6,3 +6,4 @@ xgboost
 plotly
 joblib
 yfinance
+pytest
