@@ -55,26 +55,21 @@ def test_ingest_live_upserts_rows_without_network(tmp_path, monkeypatch):
     live_df = pd.DataFrame(
         {
             "date": pd.to_datetime(["2024-01-21", "2024-01-28"]),
-            "open": [79_000.0, 81_000.0],
-            "high": [82_000.0, 84_000.0],
-            "low": [78_500.0, 80_500.0],
-            "close": [81_500.0, 83_000.0],
-            "volume": [1000.0, 1200.0],
+            "price": [81_500.0, 83_000.0],
             "pct_change": [1.875, 1.840],
         }
     )
-    monkeypatch.setattr(db_module, "fetch_live_prices", lambda period="2y", interval="1wk": live_df)
+    monkeypatch.setattr(db_module, "fetch_live_prices", lambda start="2021-09-15", interval="1wk": live_df)
 
     row_count = ingest_live(db_path=db_path)
     df = load_prices_df(db_path=db_path)
 
     assert row_count == 2
     assert len(df) == 4
-    assert {"price", "open", "high", "low", "close", "volume"}.issubset(df.columns)
+    assert {"date", "price", "pct_change"}.issubset(df.columns)
 
     updated_row = df.loc[df["date"] == pd.Timestamp("2024-01-21")].iloc[0]
     assert updated_row["price"] == pytest.approx(81_500.0)
-    assert updated_row["close"] == pytest.approx(81_500.0)
 
     inserted_row = df.loc[df["date"] == pd.Timestamp("2024-01-28")].iloc[0]
     assert inserted_row["price"] == pytest.approx(83_000.0)
@@ -93,15 +88,11 @@ def test_ingest_live_migrates_old_table_without_date_primary_key(tmp_path, monke
     live_df = pd.DataFrame(
         {
             "date": pd.to_datetime(["2024-01-21"]),
-            "open": [80_500.0],
-            "high": [82_000.0],
-            "low": [80_000.0],
-            "close": [81_500.0],
-            "volume": [1000.0],
+            "price": [81_500.0],
             "pct_change": [1.875],
         }
     )
-    monkeypatch.setattr(db_module, "fetch_live_prices", lambda period="2y", interval="1wk": live_df)
+    monkeypatch.setattr(db_module, "fetch_live_prices", lambda start="2021-09-15", interval="1wk": live_df)
 
     ingest_live(db_path=db_path)
 

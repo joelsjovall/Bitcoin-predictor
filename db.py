@@ -35,16 +35,16 @@ def load_csv(csv_path: Path = CSV_PATH) -> pd.DataFrame:
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
+    """Skapar prices-tabellen (date, price, pct_change).
+
+    Migrerar en äldre tabell som saknar PRIMARY KEY på date (behövs för
+    ON CONFLICT i ingest_live()) genom att bygga om den och kopiera över datan.
+    """
     conn = sqlite3.connect(db_path)
     schema_sql = """
         CREATE TABLE prices (
             date TEXT PRIMARY KEY,
             price REAL,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume REAL,
             pct_change REAL
         )
         """
@@ -62,11 +62,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.execute(schema_sql)
 
         old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
-        copy_columns = [
-            column
-            for column in ["date", "price", "open", "high", "low", "close", "volume", "pct_change"]
-            if column in old_columns
-        ]
+        copy_columns = [column for column in ["date", "price", "pct_change"] if column in old_columns]
         if copy_columns:
             columns_sql = ", ".join(copy_columns)
             conn.execute(
@@ -78,18 +74,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 """
             )
         conn.execute("DROP TABLE prices_old")
-        table_info = conn.execute("PRAGMA table_info(prices)").fetchall()
 
-    existing_columns = {row[1] for row in table_info}
-    for column_name, column_type in {
-        "open": "REAL",
-        "high": "REAL",
-        "low": "REAL",
-        "close": "REAL",
-        "volume": "REAL",
-    }.items():
-        if column_name not in existing_columns:
-            conn.execute(f"ALTER TABLE prices ADD COLUMN {column_name} {column_type}")
     conn.commit()
     conn.close()
 
@@ -148,23 +133,18 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2021-09-15", interval: st
     df = fetch_live_prices(start=start, interval=interval)
     if df.empty:
         return 0
+    if (df["date"].dt.dayofweek != 6).any():
+        raise ValueError("Live-data måste vara söndagsdaterad veckodata (samma vecko-cykel som CSV-historiken).")
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
-    rows = (
-        df.assign(date=df["date"].dt.strftime("%Y-%m-%d"), price=df["close"])[
-            ["date", "price", "open", "high", "low", "close", "volume", "pct_change"]
-        ]
-        .to_dict("records")
-    )
+    rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
     conn.executemany(
         """
-        INSERT INTO prices (date, price, open, high, low, close, volume, pct_change)
-        VALUES (:date, :price, :open, :high, :low, :close, :volume, :pct_change)
+        INSERT INTO prices (date, price, pct_change)
+        VALUES (:date, :price, :pct_change)
         ON CONFLICT(date) DO UPDATE SET
-            price=excluded.price,
-            open=excluded.open, high=excluded.high, low=excluded.low,
-            close=excluded.close, volume=excluded.volume, pct_change=excluded.pct_change
+            price=excluded.price, pct_change=excluded.pct_change
         """,
         rows,
     )
