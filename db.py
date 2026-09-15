@@ -151,23 +151,6 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2021-09-15", interval: st
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
-<<<<<<< HEAD
-    existing = pd.read_sql("SELECT date FROM prices ORDER BY date", conn, parse_dates=["date"])
-    combined_dates = pd.concat([existing["date"], df["date"]]).drop_duplicates().sort_values()
-    if not combined_dates.diff().dropna().eq(pd.Timedelta(weeks=1)).all():
-        conn.close()
-        raise ValueError(
-            "Datumen ger luckor eller flera priser per vecka. Om du tidigare hämtat "
-            "måndagsdata: läs in CSV på nytt och hämta sedan live-data igen."
-        )
-    rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
-    conn.executemany(
-        """
-        INSERT INTO prices (date, price, pct_change)
-        VALUES (:date, :price, :pct_change)
-        ON CONFLICT(date) DO UPDATE SET
-            price=excluded.price, pct_change=excluded.pct_change
-=======
     rows = (
         df.assign(date=df["date"].dt.strftime("%Y-%m-%d"), price=df["close"])[
             ["date", "price", "open", "high", "low", "close", "volume", "pct_change"]
@@ -182,7 +165,6 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2021-09-15", interval: st
             price=excluded.price,
             open=excluded.open, high=excluded.high, low=excluded.low,
             close=excluded.close, volume=excluded.volume, pct_change=excluded.pct_change
->>>>>>> c8120b270255394dfa2c8ec361a08aa331493ed5
         """,
         rows,
     )
