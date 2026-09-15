@@ -50,6 +50,19 @@ def get_data() -> pd.DataFrame:
     return load_prices_df()
 
 
+@st.cache_data
+def get_sp500_data() -> pd.DataFrame:
+    """Hämtar S&P 500-historik (^GSPC) direkt via yfinance, enbart för visning
+    (lagras inte i databasen och påverkar inte Bitcoin-modellen)."""
+    import yfinance as yf
+
+    raw = yf.download("^GSPC", period="max", interval="1wk", progress=False, auto_adjust=False)
+    raw = raw.reset_index()
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    return raw.rename(columns={"Date": "date", "Close": "close"})[["date", "close"]]
+
+
 @st.cache_resource
 def get_model_and_metrics(selected_method: str, selected_weeks: int):
     return train_model(get_data(), method=selected_method, horizon_weeks=selected_weeks)
@@ -175,3 +188,29 @@ with st.expander("Om modellen"):
         [{"Metod": m, "RMSE": all_metrics[m]["rmse"], "MAE": all_metrics[m]["mae"]} for m in METHODS]
     ).sort_values("RMSE")
     st.dataframe(comparison.set_index("Metod"), width="stretch")
+
+st.subheader("S&P 500 – jämförelse")
+sp500 = get_sp500_data()
+sp500 = sp500[sp500["date"] >= "2010-01-01"]
+sp500_fig = go.Figure()
+sp500_fig.add_trace(go.Scatter(x=sp500["date"], y=sp500["close"], name="S&P 500", mode="lines"))
+sp500_fig.update_layout(
+    xaxis_title="Datum",
+    yaxis_title="Pris (USD)",
+    height=550,
+    xaxis=dict(
+        type="date",
+        rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(count=1, label="1Å", step="year", stepmode="backward"),
+                dict(count=5, label="5Å", step="year", stepmode="backward"),
+                dict(step="all", label="Allt"),
+            ]
+        ),
+        rangeslider=dict(visible=True),
+    ),
+)
+st.plotly_chart(sp500_fig, width="stretch")
