@@ -49,6 +49,25 @@ METHODS = {
     ),
 }
 
+# Kandidater för hyperparameter-tuning, ett par per metod. Väljs mot valideringsdelen
+# i train_model() (se där) – hålls medvetet få för att träningstiden inte ska explodera
+# när fyra metoder x flera horisonter tränas om i appen.
+PARAM_GRIDS = {
+    "Linjär regression": [{}],
+    "SVR": [
+        {"svr__C": 1, "svr__epsilon": 0.01},
+        {"svr__C": 10, "svr__epsilon": 0.01},
+    ],
+    "Random Forest": [
+        {"randomforestregressor__n_estimators": 150, "randomforestregressor__max_depth": None},
+        {"randomforestregressor__n_estimators": 300, "randomforestregressor__max_depth": 10},
+    ],
+    "XGBoost": [
+        {"xgbregressor__n_estimators": 150, "xgbregressor__max_depth": 3},
+        {"xgbregressor__n_estimators": 300, "xgbregressor__max_depth": 6},
+    ],
+}
+
 FORECAST_HORIZONS = {
     "1 månad": 4,
     "3 månader": 13,
@@ -62,7 +81,7 @@ FORECAST_HORIZONS = {
 
 def _model_path(method: str, horizon_weeks: int) -> Path:
     slug = method.lower().replace(" ", "_").replace("ä", "a").replace("ö", "o")
-    return MODEL_DIR / f"model_v2_{slug}_{horizon_weeks}w.pkl"
+    return MODEL_DIR / f"model_v3_{slug}_{horizon_weeks}w.pkl"
 
 
 def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
@@ -108,36 +127,109 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
     return out
 
 
+MIN_EVAL_ROWS = 8  # minsta antal rader vi accepterar i en tränings-/valideringsdel
+
+
+def _price_rmse(rows: pd.DataFrame, pred_return: np.ndarray) -> float:
+    pred_price = rows["price"].values * (1 + pred_return)
+    return float(np.sqrt(mean_squared_error(rows["target_price"].values, pred_price)))
+
+
+def _three_way_split(feat: pd.DataFrame, val_size: float, test_size: float, horizon_weeks: int):
+    """Delar `feat` kronologiskt i train/val/test.
+
+    Varje fönster behöver minst `horizon_weeks` rader marginal innan nästa fönster,
+    annars sträcker sig ALLA rader mål (target_date) förbi fönstrets egen gräns och
+    läckage-trimningen (se nedan) tömmer det helt. Returnerar None om datan är för
+    kort för det vid den här horisonten – anroparen får då falla tillbaka på en
+    enklare train/test-delning.
+    """
+    n = len(feat)
+    val_rows = max(int(n * val_size), horizon_weeks + MIN_EVAL_ROWS)
+    test_rows = max(int(n * test_size), MIN_EVAL_ROWS)
+    test_start = n - test_rows
+    val_start = test_start - val_rows
+    if val_start < horizon_weeks + MIN_EVAL_ROWS:
+        return None
+
+    train, val, test = feat.iloc[:val_start], feat.iloc[val_start:test_start], feat.iloc[test_start:]
+
+    # Undvik läckage: ta bort träningsrader vars mål (target_date) sträcker sig in i
+    # valideringsperioden, och valideringsrader vars mål sträcker sig in i testperioden.
+    train = train.loc[train["target_date"] < val["date"].iloc[0]]
+    val = val.loc[val["target_date"] < test["date"].iloc[0]]
+    if len(train) < MIN_EVAL_ROWS or len(val) < MIN_EVAL_ROWS or len(test) < 2:
+        return None
+    return train, val, test
+
+
 def train_model(
     df: pd.DataFrame | None = None,
     method: str = "Random Forest",
     horizon_weeks: int = 1,
+    val_size: float = 0.2,
     test_size: float = 0.2,
 ):
+    """Tränar `method` mot `horizon_weeks` med en kronologisk tränings-/validerings-/
+    testdelning (standard 60/20/20).
+
+    1. Ett par hyperparameter-kandidater (se PARAM_GRIDS) tränas på träningsdelen och
+       utvärderas på valideringsdelen – den med lägst val-RMSE vinner.
+    2. De vinnande hyperparametrarna tränas om på träning+validering och utvärderas en
+       enda gång på den helt osedda testdelen – det är detta som rapporteras som
+       modellens riktiga prestanda (mae/rmse/r2 i den returnerade metrics-dicten).
+    3. Den slutliga modellen som faktiskt används för prognoser tränas om en sista gång
+       med samma hyperparametrar men på *all* tillgänglig data (train+val+test), så att
+       den verkliga prognosen får utnyttja så mycket historik som möjligt. Testdelens
+       enda syfte är alltså att ge en ärlig uppskattning av hur bra den modellen är.
+
+    För långa horisonter (t.ex. 5 år) räcker vår ~16-åriga historik inte till tre
+    helt separata, läckagefria fönster (varje fönster behöver egen marginal på minst
+    horizon_weeks rader). Då faller vi tillbaka på en enkel 80/20 train/test-delning
+    med metodens standardhyperparametrar (ingen tuning) – `metrics["tuned"]` visar
+    vilket som skedde.
+    """
     if method not in METHODS:
         raise ValueError(f"Okänd metod: {method}. Välj bland {list(METHODS)}")
     if df is None:
         df = load_prices_df()
+    if not 0 < val_size < 1 or not 0 < test_size < 1 or val_size + test_size >= 1:
+        raise ValueError("val_size och test_size måste vara mellan 0 och 1 och summera till mindre än 1.")
 
     feat = build_features(df, horizon_weeks).dropna(subset=FEATURE_COLUMNS + ["target_return"])
 
-    if not 0 < test_size < 1:
-        raise ValueError("test_size måste vara mellan 0 och 1.")
-    split_idx = int(len(feat) * (1 - test_size))
-    train, test = feat.iloc[:split_idx], feat.iloc[split_idx:]
-    if train.empty or len(test) < 2:
-        raise ValueError("För lite historik för vald horisont och testperiod.")
-    train = train.loc[train["target_date"] < test["date"].iloc[0]]
-    if train.empty:
-        raise ValueError("För lite historik för att skilja träningsmål från testperioden.")
+    split = _three_way_split(feat, val_size, test_size, horizon_weeks)
+    if split is not None:
+        train, val, test = split
+        best_params, best_val_rmse = None, np.inf
+        for params in PARAM_GRIDS[method]:
+            candidate = METHODS[method]()
+            if params:
+                candidate.set_params(**params)
+            candidate.fit(train[FEATURE_COLUMNS], train["target_return"])
+            val_rmse = _price_rmse(val, candidate.predict(val[FEATURE_COLUMNS]))
+            if val_rmse < best_val_rmse:
+                best_val_rmse, best_params = val_rmse, params
+        train_for_eval = pd.concat([train, val])
+        n_train, n_val, tuned = len(train), len(val), True
+    else:
+        n = len(feat)
+        test_rows = max(int(n * test_size), 2)
+        test_start = n - test_rows
+        train_for_eval, test = feat.iloc[:test_start], feat.iloc[test_start:]
+        train_for_eval = train_for_eval.loc[train_for_eval["target_date"] < test["date"].iloc[0]]
+        if train_for_eval.empty or len(test) < 2:
+            raise ValueError("För lite historik för vald horisont.")
+        best_params, best_val_rmse, n_train, n_val, tuned = None, None, len(train_for_eval), 0, False
 
-    X_train, y_train = train[FEATURE_COLUMNS], train["target_return"]
-    X_test, y_test = test[FEATURE_COLUMNS], test["target_return"]
+    # Sluttest: den vinnande (eller, om tuning inte var möjlig, standard-) konfigurationen
+    # tränas om på train_for_eval och utvärderas en enda gång på den helt osedda testdelen.
+    eval_model = METHODS[method]()
+    if best_params:
+        eval_model.set_params(**best_params)
+    eval_model.fit(train_for_eval[FEATURE_COLUMNS], train_for_eval["target_return"])
 
-    model = METHODS[method]()
-    model.fit(X_train, y_train)
-
-    pred_return = model.predict(X_test)
+    pred_return = eval_model.predict(test[FEATURE_COLUMNS])
     pred_price = test["price"].values * (1 + pred_return)
     actual_price = test["target_price"].values
     naive_price = test["price"].values  # baseline: priset om N veckor = samma som nu
@@ -145,17 +237,27 @@ def train_model(
     metrics = {
         "method": method,
         "horizon_weeks": horizon_weeks,
+        "tuned": tuned,
+        "best_params": best_params,
+        "val_rmse": best_val_rmse,
         "mae": mean_absolute_error(actual_price, pred_price),
         "rmse": np.sqrt(mean_squared_error(actual_price, pred_price)),
         "r2": r2_score(actual_price, pred_price),
         "naive_mae": mean_absolute_error(actual_price, naive_price),
         "naive_rmse": np.sqrt(mean_squared_error(actual_price, naive_price)),
-        "n_train": len(train),
+        "n_train": n_train,
+        "n_val": n_val,
         "n_test": len(test),
     }
 
-    joblib.dump(model, _model_path(method, horizon_weeks))
-    return model, metrics
+    # Produktionsmodell: samma hyperparametrar, tränad på all tillgänglig data.
+    production_model = METHODS[method]()
+    if best_params:
+        production_model.set_params(**best_params)
+    production_model.fit(feat[FEATURE_COLUMNS], feat["target_return"])
+
+    joblib.dump(production_model, _model_path(method, horizon_weeks))
+    return production_model, metrics
 
 
 def load_model(method: str = "Random Forest", horizon_weeks: int = 1):
@@ -191,7 +293,9 @@ if __name__ == "__main__":
         for method_name in METHODS:
             trained_model, m = train_model(method=method_name, horizon_weeks=weeks)
             price = predict_price(model=trained_model, horizon_weeks=weeks)
+            val_rmse_str = f"{m['val_rmse']:>10,.0f}" if m["tuned"] else "     (ej tunad)"
             print(
-                f"  {method_name:20s} RMSE {m['rmse']:>12,.0f} "
-                f"(naiv {m['naive_rmse']:>12,.0f})  prognos: {price:>12,.0f}"
+                f"  {method_name:20s} val-RMSE {val_rmse_str}  "
+                f"test-RMSE {m['rmse']:>12,.0f} (naiv {m['naive_rmse']:>12,.0f})  "
+                f"params {m['best_params']}  prognos: {price:>12,.0f}"
             )

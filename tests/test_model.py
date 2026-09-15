@@ -6,7 +6,7 @@ import model as model_module
 from model import FEATURE_COLUMNS, build_features, predict_price, train_model
 
 
-def make_price_frame(periods: int = 150) -> pd.DataFrame:
+def make_price_frame(periods: int = 220) -> pd.DataFrame:
     dates = pd.date_range("2023-01-01", periods=periods, freq="W")
     trend = np.linspace(20_000, 30_000, periods)
     seasonal = np.sin(np.arange(periods) / 3) * 500
@@ -35,13 +35,15 @@ def test_train_model_returns_metrics_and_saves_model(tmp_path, monkeypatch):
     monkeypatch.setattr(model_module, "MODEL_DIR", tmp_path)
     df = make_price_frame()
 
-    trained_model, metrics = train_model(df, test_size=0.25)
+    trained_model, metrics = train_model(df, val_size=0.2, test_size=0.2)
 
     assert hasattr(trained_model, "predict")
     assert model_module._model_path("Random Forest", 1).exists()
     assert metrics["n_train"] > 0
+    assert metrics["n_val"] > 0
     assert metrics["n_test"] > 0
-    for key in ["mae", "rmse", "r2", "naive_mae", "naive_rmse"]:
+    assert "best_params" in metrics
+    for key in ["val_rmse", "mae", "rmse", "r2", "naive_mae", "naive_rmse"]:
         assert key in metrics
         assert np.isfinite(metrics[key])
 
@@ -49,7 +51,7 @@ def test_train_model_returns_metrics_and_saves_model(tmp_path, monkeypatch):
 def test_predict_price_returns_positive_float(tmp_path, monkeypatch):
     monkeypatch.setattr(model_module, "MODEL_DIR", tmp_path)
     df = make_price_frame()
-    trained_model, _ = train_model(df, test_size=0.25)
+    trained_model, _ = train_model(df, val_size=0.2, test_size=0.2)
 
     prediction = predict_price(df, trained_model)
 

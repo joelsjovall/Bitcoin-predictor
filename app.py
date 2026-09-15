@@ -120,12 +120,39 @@ st.dataframe(
 )
 
 with st.expander("Om modellen"):
-    st.write(
-        f"""
+    if metrics["tuned"]:
+        methodology = f"""
         **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
-        om {weeks_ahead} veckor?") på {metrics['n_train']} exempel och testad på
-        {metrics['n_test']} (senaste delen av tidsserien).
+        om {weeks_ahead} veckor?") med en kronologisk **tränings-/validerings-/test**-
+        uppdelning: {metrics['n_train']} tränings-, {metrics['n_val']} validerings- och
+        {metrics['n_test']} testexempel (äldst → nyast).
 
+        1. Ett par hyperparameter-kandidater tränas på träningsdelen och jämförs på
+           valideringsdelen – bästa valet: `{metrics['best_params'] or "standardvärden"}`
+           (val-RMSE: {metrics['val_rmse']:.1f}).
+        2. De vinnande hyperparametrarna tränas om på träning+validering och testas en
+           **enda gång** på den helt osedda testdelen – det är detta som rapporteras
+           nedan som modellens riktiga prestanda.
+        3. Den modell som faktiskt gör prognosen ovan tränas därefter om en sista gång
+           på **all** tillgänglig data (träning+validering+test), så att prognosen får
+           utnyttja så mycket historik som möjligt. Testdelens enda syfte är att ge en
+           ärlig uppskattning av träffsäkerheten – inte att vara med i den slutliga
+           prognosmodellen.
+        """
+    else:
+        methodology = f"""
+        **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
+        om {weeks_ahead} veckor?"). Vår ~16-åriga historik räcker inte till tre helt
+        separata, läckagefria fönster vid så här lång horisont (varje fönster behöver
+        egen marginal på minst {weeks_ahead} veckor) – appen föll därför tillbaka på en
+        enklare uppdelning: {metrics['n_train']} tränings- och {metrics['n_test']}
+        testexempel (äldst → nyast), med metodens standardhyperparametrar (ingen
+        validerings-tuning för den här horisonten).
+        """
+    st.write(
+        methodology
+        + f"""
+        **Testresultat (helt osedd data):**
         - MAE: {metrics['mae']:.1f} (naiv baseline, dvs. "priset om {weeks_ahead} veckor
           = samma som nu": {metrics['naive_mae']:.1f})
         - RMSE: {metrics['rmse']:.1f} (naiv baseline: {metrics['naive_rmse']:.1f})
