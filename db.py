@@ -35,16 +35,46 @@ def load_csv(csv_path: Path = CSV_PATH) -> pd.DataFrame:
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
+    """Skapar prices-tabellen (date, price, pct_change).
+
+    Migrerar en äldre tabell som saknar PRIMARY KEY på date (behövs för
+    ON CONFLICT i ingest_live()) genom att bygga om den och kopiera över datan.
+    """
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS prices (
+    schema_sql = """
+        CREATE TABLE prices (
             date TEXT PRIMARY KEY,
             price REAL,
             pct_change REAL
         )
         """
-    )
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prices'"
+    ).fetchone()
+
+    if not table_exists:
+        conn.execute(schema_sql)
+
+    table_info = conn.execute("PRAGMA table_info(prices)").fetchall()
+    has_date_primary_key = any(row[1] == "date" and row[5] for row in table_info)
+    if table_info and not has_date_primary_key:
+        conn.execute("ALTER TABLE prices RENAME TO prices_old")
+        conn.execute(schema_sql)
+
+        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
+        copy_columns = [column for column in ["date", "price", "pct_change"] if column in old_columns]
+        if copy_columns:
+            columns_sql = ", ".join(copy_columns)
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO prices ({columns_sql})
+                SELECT {columns_sql}
+                FROM prices_old
+                WHERE date IS NOT NULL
+                """
+            )
+        conn.execute("DROP TABLE prices_old")
+
     conn.commit()
     conn.close()
 
@@ -103,17 +133,11 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2021-09-15", interval: st
     df = fetch_live_prices(start=start, interval=interval)
     if df.empty:
         return 0
+    if (df["date"].dt.dayofweek != 6).any():
+        raise ValueError("Live-data måste vara söndagsdaterad veckodata (samma vecko-cykel som CSV-historiken).")
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
-    existing = pd.read_sql("SELECT date FROM prices ORDER BY date", conn, parse_dates=["date"])
-    combined_dates = pd.concat([existing["date"], df["date"]]).drop_duplicates().sort_values()
-    if not combined_dates.diff().dropna().eq(pd.Timedelta(weeks=1)).all():
-        conn.close()
-        raise ValueError(
-            "Datumen ger luckor eller flera priser per vecka. Om du tidigare hämtat "
-            "måndagsdata: läs in CSV på nytt och hämta sedan live-data igen."
-        )
     rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
     conn.executemany(
         """
