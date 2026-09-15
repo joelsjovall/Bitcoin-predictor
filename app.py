@@ -15,11 +15,13 @@ with st.sidebar:
         n = ingest_csv()
         st.success(f"Laddade in {n} rader.")
         st.cache_data.clear()
+        st.cache_resource.clear()
     if st.button("Hämta senaste data (live)"):
         try:
             n = ingest_live()
             st.success(f"Hämtade/uppdaterade {n} rader från Yahoo Finance.")
             st.cache_data.clear()
+            st.cache_resource.clear()
         except Exception as e:
             st.error(f"Kunde inte hämta live-data: {e}")
     if st.button("Träna om modellen"):

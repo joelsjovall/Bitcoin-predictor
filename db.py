@@ -68,14 +68,17 @@ def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
     return len(df)
 
 
-def fetch_live_prices(start: str = "2014-09-15", interval: str = "1wk") -> pd.DataFrame:
+def fetch_live_prices(start: str = "2021-09-15", interval: str = "1wk") -> pd.DataFrame:
     """Hämtar BTC-USD-priser från Yahoo Finance från och med `start` till idag
     (samma schema som CSV-datan)."""
     import yfinance as yf
 
-    raw = yf.download("BTC-USD", start=start, interval=interval, progress=False, auto_adjust=False)
+    if interval != "1wk":
+        raise ValueError("Modellen kräver veckodata (interval='1wk').")
+    # Dagliga stängningspriser ger gemensamma söndagsdatum med CSV-filen.
+    raw = yf.download("BTC-USD", start=start, interval="1d", progress=False, auto_adjust=False)
     if raw.empty:
-        return pd.DataFrame(columns=["date", "price", "pct_change"])
+        raise RuntimeError("Yahoo Finance returnerade inga priser. Kontrollera anslutningen och försök igen.")
 
     raw = raw.reset_index()
     if isinstance(raw.columns, pd.MultiIndex):
@@ -83,14 +86,19 @@ def fetch_live_prices(start: str = "2014-09-15", interval: str = "1wk") -> pd.Da
 
     df = raw.rename(columns={"Date": "date", "Close": "price"})[["date", "price"]]
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-    df = df.sort_values("date").reset_index(drop=True)
-    df["pct_change"] = df["price"].pct_change() * 100
-    return df.dropna(subset=["price"])
+    today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+    df = df.loc[df["date"] < today].dropna(subset=["price"])
+    # Ta endast faktiska söndagsstängningar; fyll inte luckor med äldre priser.
+    df = df.loc[df["date"].dt.dayofweek == 6].sort_values("date").reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError("Yahoo Finance returnerade inga avslutade söndagspriser.")
+    df["pct_change"] = df["price"].pct_change(fill_method=None) * 100
+    return df
 
 
-def ingest_live(db_path: Path = DB_PATH, start: str = "2014-09-15", interval: str = "1wk") -> int:
+def ingest_live(db_path: Path = DB_PATH, start: str = "2021-09-15", interval: str = "1wk") -> int:
     """Hämtar data från Yahoo Finance (från `start` till idag) och skriver in den i
-    databasen (kompletterar/uppdaterar, skriver inte över den historiska CSV-datan).
+    databasen (uppdaterar matchande datum och behåller äldre CSV-historik).
     Returnerar antal rader som hämtades."""
     df = fetch_live_prices(start=start, interval=interval)
     if df.empty:
@@ -98,6 +106,14 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2014-09-15", interval: st
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
+    existing = pd.read_sql("SELECT date FROM prices ORDER BY date", conn, parse_dates=["date"])
+    combined_dates = pd.concat([existing["date"], df["date"]]).drop_duplicates().sort_values()
+    if not combined_dates.diff().dropna().eq(pd.Timedelta(weeks=1)).all():
+        conn.close()
+        raise ValueError(
+            "Datumen ger luckor eller flera priser per vecka. Om du tidigare hämtat "
+            "måndagsdata: läs in CSV på nytt och hämta sedan live-data igen."
+        )
     rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
     conn.executemany(
         """
@@ -123,5 +139,10 @@ def load_prices_df(db_path: Path = DB_PATH) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    n = ingest_csv()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Läs in Bitcoin-priser i databasen.")
+    parser.add_argument("--live", action="store_true", help="Hämta senaste avslutade veckopriser från Yahoo Finance")
+    args = parser.parse_args()
+    n = ingest_live() if args.live else ingest_csv()
     print(f"Lade in {n} rader i {DB_PATH}")

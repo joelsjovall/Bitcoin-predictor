@@ -15,8 +15,18 @@ from xgboost import XGBRegressor
 from db import load_prices_df
 
 MODEL_DIR = Path(__file__).parent
+HALVINGS = pd.to_datetime(["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"])
 
 FEATURE_COLUMNS = [
+    "return_1w",
+    "return_4w",
+    "return_12w",
+    "return_52w",
+    "volatility_12w",
+    "volatility_52w",
+    "distance_from_ath",
+    "weeks_since_halving",
+    "has_halving",
     "pct_change",
     "ret_lag_1",
     "ret_lag_2",
@@ -44,6 +54,7 @@ FORECAST_HORIZONS = {
     "3 månader": 13,
     "6 månader": 26,
     "1 år": 52,
+    "2 år": 104,
     "3 år": 156,
     "5 år": 260,
 }
@@ -51,7 +62,7 @@ FORECAST_HORIZONS = {
 
 def _model_path(method: str, horizon_weeks: int) -> Path:
     slug = method.lower().replace(" ", "_").replace("ä", "a").replace("ö", "o")
-    return MODEL_DIR / f"model_{slug}_{horizon_weeks}w.pkl"
+    return MODEL_DIR / f"model_v2_{slug}_{horizon_weeks}w.pkl"
 
 
 def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
@@ -67,13 +78,32 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
     exponentiellt över långa horisonter.
     """
     out = df.copy().sort_values("date").reset_index(drop=True)
-    ret = out["price"].pct_change()
+    out["date"] = pd.to_datetime(out["date"])
+    if horizon_weeks < 1 or not isinstance(horizon_weeks, int):
+        raise ValueError("horizon_weeks måste vara ett positivt heltal.")
+    if not out["date"].diff().dropna().eq(pd.Timedelta(weeks=1)).all():
+        raise ValueError("Datan måste ha exakt en observation per vecka utan luckor.")
+    if out.empty or out["price"].isna().any() or not np.isfinite(out["price"]).all() or (out["price"] <= 0).any():
+        raise ValueError("Datan måste innehålla positiva, ändliga priser.")
+    ret = out["price"].pct_change(fill_method=None)
+    out["pct_change"] = ret * 100
+    for weeks in (1, 4, 12, 52):
+        out[f"return_{weeks}w"] = out["price"].pct_change(weeks, fill_method=None)
+    for weeks in (12, 52):
+        out[f"volatility_{weeks}w"] = ret.rolling(weeks).std()
+    out["distance_from_ath"] = out["price"] / out["price"].cummax() - 1
+    last_halving = pd.Series(pd.NaT, index=out.index, dtype="datetime64[ns]")
+    for halving in HALVINGS:
+        last_halving.loc[out["date"] >= halving] = halving
+    out["has_halving"] = last_halving.notna().astype(int)
+    out["weeks_since_halving"] = ((out["date"] - last_halving).dt.days / 7).fillna(0)
     out["ret_lag_1"] = ret.shift(1)
     out["ret_lag_2"] = ret.shift(2)
     out["ret_lag_3"] = ret.shift(3)
     out["rolling_mean_return_4"] = ret.shift(1).rolling(4).mean()
     out["rolling_std_return_4"] = ret.shift(1).rolling(4).std()
     out["target_price"] = out["price"].shift(-horizon_weeks)
+    out["target_date"] = out["date"].shift(-horizon_weeks)
     out["target_return"] = out["target_price"] / out["price"] - 1
     return out
 
@@ -91,8 +121,15 @@ def train_model(
 
     feat = build_features(df, horizon_weeks).dropna(subset=FEATURE_COLUMNS + ["target_return"])
 
+    if not 0 < test_size < 1:
+        raise ValueError("test_size måste vara mellan 0 och 1.")
     split_idx = int(len(feat) * (1 - test_size))
     train, test = feat.iloc[:split_idx], feat.iloc[split_idx:]
+    if train.empty or len(test) < 2:
+        raise ValueError("För lite historik för vald horisont och testperiod.")
+    train = train.loc[train["target_date"] < test["date"].iloc[0]]
+    if train.empty:
+        raise ValueError("För lite historik för att skilja träningsmål från testperioden.")
 
     X_train, y_train = train[FEATURE_COLUMNS], train["target_return"]
     X_test, y_test = test[FEATURE_COLUMNS], test["target_return"]
@@ -142,6 +179,8 @@ def predict_price(
 
     feat = build_features(df, horizon_weeks)
     latest = feat.iloc[[-1]]
+    if latest[FEATURE_COLUMNS].isna().any().any():
+        raise ValueError("Prognosen kräver minst 53 veckopriser.")
     pred_return = model.predict(latest[FEATURE_COLUMNS])[0]
     return float(latest["price"].iloc[0] * (1 + pred_return))
 
