@@ -5,3 +5,5 @@ venv/
 bitcoin.db
 model_*.pkl
 .streamlit/
+
+.pytest-tmp-*/
