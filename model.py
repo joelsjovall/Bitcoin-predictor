@@ -13,9 +13,11 @@ from sklearn.svm import SVR
 from xgboost import XGBRegressor
 
 from db import load_prices_df
+from macro import MACRO_FEATURE_COLUMNS, build_macro_features
 
 MODEL_DIR = Path(__file__).parent
 HALVINGS = pd.to_datetime(["2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"])
+ESTIMATED_HALVING_INTERVAL_WEEKS = 208
 
 FEATURE_COLUMNS = [
     "return_1w",
@@ -26,8 +28,8 @@ FEATURE_COLUMNS = [
     "volatility_52w",
     "distance_from_ath",
     "weeks_since_halving",
+    "weeks_to_halving",
     "has_halving",
-    "pct_change",
     "ret_lag_1",
     "ret_lag_2",
     "ret_lag_3",
@@ -79,12 +81,13 @@ FORECAST_HORIZONS = {
 }
 
 
-def _model_path(method: str, horizon_weeks: int) -> Path:
+def _model_path(method: str, horizon_weeks: int, include_macro: bool = False) -> Path:
     slug = method.lower().replace(" ", "_").replace("ä", "a").replace("ö", "o")
-    return MODEL_DIR / f"model_v3_{slug}_{horizon_weeks}w.pkl"
+    prefix = "model_v4_macro_v1" if include_macro else "model_v4"
+    return MODEL_DIR / f"{prefix}_{slug}_{horizon_weeks}w.pkl"
 
 
-def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, horizon_weeks: int = 1, macro_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """Bygger features och ett mål `horizon_weeks` veckor framåt.
 
     df måste innehålla kolumnerna date, price, pct_change och vara sorterad äldst
@@ -116,6 +119,9 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
         last_halving.loc[out["date"] >= halving] = halving
     out["has_halving"] = last_halving.notna().astype(int)
     out["weeks_since_halving"] = ((out["date"] - last_halving).dt.days / 7).fillna(0)
+    out["weeks_to_halving"] = (
+        ESTIMATED_HALVING_INTERVAL_WEEKS - out["weeks_since_halving"]
+    ).clip(lower=0).where(out["has_halving"].eq(1), 0)
     out["ret_lag_1"] = ret.shift(1)
     out["ret_lag_2"] = ret.shift(2)
     out["ret_lag_3"] = ret.shift(3)
@@ -124,6 +130,8 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1) -> pd.DataFrame:
     out["target_price"] = out["price"].shift(-horizon_weeks)
     out["target_date"] = out["date"].shift(-horizon_weeks)
     out["target_return"] = out["target_price"] / out["price"] - 1
+    if macro_df is not None:
+        out = out.merge(build_macro_features(out["date"], macro_df), on="date", how="left", validate="one_to_one")
     return out
 
 
@@ -169,6 +177,7 @@ def train_model(
     horizon_weeks: int = 1,
     val_size: float = 0.2,
     test_size: float = 0.2,
+    macro_df: pd.DataFrame | None = None,
 ):
     """Tränar `method` mot `horizon_weeks` med en kronologisk tränings-/validerings-/
     testdelning (standard 60/20/20).
@@ -196,7 +205,10 @@ def train_model(
     if not 0 < val_size < 1 or not 0 < test_size < 1 or val_size + test_size >= 1:
         raise ValueError("val_size och test_size måste vara mellan 0 och 1 och summera till mindre än 1.")
 
-    feat = build_features(df, horizon_weeks).dropna(subset=FEATURE_COLUMNS + ["target_return"])
+    feature_columns = FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    feat = build_features(df, horizon_weeks, macro_df).dropna(subset=feature_columns + ["target_return"])
+    if len(feat) < 3:
+        raise ValueError("För lite komplett historik för vald modell och horisont.")
 
     split = _three_way_split(feat, val_size, test_size, horizon_weeks)
     if split is not None:
@@ -206,8 +218,8 @@ def train_model(
             candidate = METHODS[method]()
             if params:
                 candidate.set_params(**params)
-            candidate.fit(train[FEATURE_COLUMNS], train["target_return"])
-            val_rmse = _price_rmse(val, candidate.predict(val[FEATURE_COLUMNS]))
+            candidate.fit(train[feature_columns], train["target_return"])
+            val_rmse = _price_rmse(val, candidate.predict(val[feature_columns]))
             if val_rmse < best_val_rmse:
                 best_val_rmse, best_params = val_rmse, params
         train_for_eval = pd.concat([train, val])
@@ -227,9 +239,9 @@ def train_model(
     eval_model = METHODS[method]()
     if best_params:
         eval_model.set_params(**best_params)
-    eval_model.fit(train_for_eval[FEATURE_COLUMNS], train_for_eval["target_return"])
+    eval_model.fit(train_for_eval[feature_columns], train_for_eval["target_return"])
 
-    pred_return = eval_model.predict(test[FEATURE_COLUMNS])
+    pred_return = eval_model.predict(test[feature_columns])
     pred_price = test["price"].values * (1 + pred_return)
     actual_price = test["target_price"].values
     naive_price = test["price"].values  # baseline: priset om N veckor = samma som nu
@@ -248,22 +260,34 @@ def train_model(
         "n_train": n_train,
         "n_val": n_val,
         "n_test": len(test),
+        "test_start": test["date"].iloc[0],
+        "test_end": test["date"].iloc[-1],
+        "test_dates": test["date"].tolist(),
+        "test_target_start": test["target_date"].min(),
+        "test_target_end": test["target_date"].max(),
+        "data_start": pd.to_datetime(df["date"]).min(),
+        "data_end": pd.to_datetime(df["date"]).max(),
+        "production_train_start": feat["date"].min(),
+        "production_train_end": feat["date"].max(),
+        "production_target_end": feat["target_date"].max(),
+        "n_production": len(feat),
+        "return_rmse_pct": float(np.sqrt(mean_squared_error(test["target_return"], pred_return)) * 100),
     }
 
     # Produktionsmodell: samma hyperparametrar, tränad på all tillgänglig data.
     production_model = METHODS[method]()
     if best_params:
         production_model.set_params(**best_params)
-    production_model.fit(feat[FEATURE_COLUMNS], feat["target_return"])
+    production_model.fit(feat[feature_columns], feat["target_return"])
 
-    joblib.dump(production_model, _model_path(method, horizon_weeks))
+    joblib.dump(production_model, _model_path(method, horizon_weeks, macro_df is not None))
     return production_model, metrics
 
 
-def load_model(method: str = "Random Forest", horizon_weeks: int = 1):
-    path = _model_path(method, horizon_weeks)
+def load_model(method: str = "Random Forest", horizon_weeks: int = 1, macro_df: pd.DataFrame | None = None):
+    path = _model_path(method, horizon_weeks, macro_df is not None)
     if not path.exists():
-        return train_model(method=method, horizon_weeks=horizon_weeks)[0]
+        return train_model(method=method, horizon_weeks=horizon_weeks, macro_df=macro_df)[0]
     return joblib.load(path)
 
 
@@ -272,18 +296,20 @@ def predict_price(
     model=None,
     method: str = "Random Forest",
     horizon_weeks: int = 1,
+    macro_df: pd.DataFrame | None = None,
 ) -> float:
     """Förutspår priset `horizon_weeks` veckor efter senaste kända datapunkten."""
     if df is None:
         df = load_prices_df()
     if model is None:
-        model = load_model(method, horizon_weeks)
+        model = load_model(method, horizon_weeks, macro_df)
 
-    feat = build_features(df, horizon_weeks)
+    feature_columns = FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    feat = build_features(df, horizon_weeks, macro_df)
     latest = feat.iloc[[-1]]
-    if latest[FEATURE_COLUMNS].isna().any().any():
-        raise ValueError("Prognosen kräver minst 53 veckopriser.")
-    pred_return = model.predict(latest[FEATURE_COLUMNS])[0]
+    if latest[feature_columns].isna().any().any():
+        raise ValueError("Prognosen kräver minst 53 veckopriser och kompletta, aktuella data för alla valda faktorer.")
+    pred_return = model.predict(latest[feature_columns])[0]
     return float(latest["price"].iloc[0] * (1 + pred_return))
 
 

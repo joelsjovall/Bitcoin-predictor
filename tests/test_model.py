@@ -57,3 +57,33 @@ def test_predict_price_returns_positive_float(tmp_path, monkeypatch):
 
     assert isinstance(prediction, float)
     assert prediction > 0
+
+
+def test_feature_columns_excludes_duplicate_return():
+    assert "pct_change" not in FEATURE_COLUMNS
+    assert "return_1w" in FEATURE_COLUMNS
+    assert "weeks_to_halving" in FEATURE_COLUMNS
+
+
+def test_weeks_to_halving_counts_down_and_resets():
+    dates = pd.to_datetime(["2024-04-13", "2024-04-20", "2024-04-27"])
+    features = build_features(pd.DataFrame({"date": dates, "price": [100, 101, 102]}))
+
+    assert features["weeks_to_halving"].tolist() == pytest.approx([23 / 7, 208, 207])
+
+
+def test_weeks_to_halving_handles_missing_and_overdue_halvings():
+    for date in ["2012-11-21", "2030-01-01"]:
+        features = build_features(pd.DataFrame({"date": [date], "price": [100]}))
+        assert features.loc[0, "weeks_to_halving"] == 0
+
+
+def test_weeks_to_halving_does_not_use_future_halvings(monkeypatch):
+    frame = make_price_frame(periods=60)
+    original = build_features(frame)
+    monkeypatch.setattr(model_module, "HALVINGS", model_module.HALVINGS[:-1])
+    without_future_halving = build_features(frame)
+
+    pd.testing.assert_frame_equal(
+        original[FEATURE_COLUMNS], without_future_halving[FEATURE_COLUMNS]
+    )
