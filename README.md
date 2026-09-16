@@ -27,7 +27,7 @@ Makromodellen har separat cache och filprefix `model_v4_macro_v1_`; Bitcoin-mode
 skrivs inte över. Saknad historik eller nedladdningsfel visas vid graf 2 utan att
 stoppa graf 1. Även femårsmodellen kräver tillräcklig överlappande historik.
 Testdatum visas och appen varnar om modellernas RMSE gäller olika testdatum.
-Makrografen visar även RMSE för avkastning i procentenheter. Fler faktorer garanterar
+Makrografen visar RMSE i USD. Fler faktorer garanterar
 inte bättre prognoser. Historiska leverantörsdata är inte en point-in-time-databas
 och kan ha reviderats. Bitcoin-datum måste motsvara när priset faktiskt var känt.
 
@@ -38,8 +38,8 @@ Källor: [yfinance download](https://ranaroussi.github.io/yfinance/reference/api
 
 ## Bitcoin-features
 
-Båda prognoserna visar samma RMSE-mått: test-RMSE i USD och test-RMSE för
-avkastning i procentenheter. Appen skiljer mellan hela Bitcoin-historiken,
+Båda prognoserna visar samma RMSE-mått: test-RMSE i USD.
+Appen skiljer mellan hela Bitcoin-historiken,
 slutmodellens kompletta träningsexempel, testets prognosdatum och deras utfallsdatum.
 En femårsprognos kan bara tränas på startdatum vars utfall 260 veckor senare redan
 är känt. Slutmodellen använder alla kompletta exempel, inklusive testdelen efter
@@ -90,3 +90,26 @@ körs. Nya sparade modeller använder prefixet `model_v4_` så att gamla modelle
 med andra indatakolumner inte laddas. Test-RMSE och MAE jämförs med oförändrat
 pris som referens; fler faktorer garanterar inte bättre prognoser. Jämför även
 med modellen utan de nya faktorerna på samma testdatum för att mäta förbättring.
+
+### Rullande historiska tester
+
+Appen kör även `rolling_backtest` för vald modell och horisont, separat för
+Bitcoin och Bitcoin + makro. Var 13:e vecka tränas en ny modell på alla kompletta
+exempel vars utfallsdatum ligger strikt före prognosdatumet. Minst 104 sådana
+exempel krävs. De första 52 veckorna behövs dessutom för indikatorerna.
+
+Hyperparametrar väljs på de senaste 20 procenten av då kända träningsexempel
+om minst 104 exempel återstår för inre träning efter att överlappande mål tagits
+bort. Annars används metodens standardinställningar. Inställningar från den
+senare slutmodellen återanvänds aldrig i dessa historiska tester.
+
+Alla rullande testutfall måste ligga före senaste sluttestets första prognosdatum.
+Sluttestets mått och produktionsmodellens träning är oförändrade. Långa horisonter
+kan därför sakna tillräckligt med tidigare testhistorik; detta anges i appen.
+Resultaten cachelagras, men första körningen för en modell och horisont tar längre tid.
+
+Appen visar RMSE i USD, historiska prognoser mot faktiska utfall samt
+en separat historisk 80-procentsfelmarginal för respektive utvärdering. Felmarginalen
+är 80:e percentilen (avrundad uppåt till ett observerat fel) av
+`abs(utfall - prognos) / prognos`. Den beskriver de uppmätta felen, inte en kalibrerad
+sannolikhet för nästa prognos. Överlappande prognoser är inte oberoende cykler.

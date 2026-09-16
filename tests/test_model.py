@@ -43,9 +43,22 @@ def test_train_model_returns_metrics_and_saves_model(tmp_path, monkeypatch):
     assert metrics["n_val"] > 0
     assert metrics["n_test"] > 0
     assert "best_params" in metrics
-    for key in ["val_rmse", "mae", "rmse", "r2", "naive_mae", "naive_rmse"]:
+    for key in ["val_rmse", "mae", "rmse", "r2", "naive_mae", "naive_rmse", "historical_margin_pct"]:
         assert key in metrics
         assert np.isfinite(metrics[key])
+
+
+def test_historical_margin_covers_at_least_eighty_percent_relative_to_prediction():
+    predictions = np.full(10, 100.0)
+    actual = np.array([100, 101, 98, 103, 96, 105, 94, 107, 70, 200])
+    margin = model_module.historical_price_margin(actual, predictions)
+    assert margin == pytest.approx(30)
+    assert np.mean(np.abs(actual - predictions) <= predictions * margin / 100) >= 0.8
+
+
+@pytest.mark.parametrize("predictions", [[0, 100], [-10, 100], [np.nan, 100], [np.inf, 100]])
+def test_historical_margin_does_not_silently_exclude_invalid_predictions(predictions):
+    assert model_module.historical_price_margin([100, 100], predictions) is None
 
 
 def test_predict_price_returns_positive_float(tmp_path, monkeypatch):
