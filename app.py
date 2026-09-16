@@ -57,19 +57,19 @@ def get_macro_data(start: str) -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_macro_model_and_metrics(selected_method: str, selected_weeks: int, bitcoin_data: pd.DataFrame, macro_data: pd.DataFrame):
+def get_macro_model_and_metrics(selected_method: str, selected_weeks: int, bitcoin_data: pd.DataFrame, macro_data: pd.DataFrame, training_version=2):
     # Metrics include the historical 80% price margin.
     return train_model(bitcoin_data, method=selected_method, horizon_weeks=selected_weeks, macro_df=macro_data)
 
 
 @st.cache_resource
-def get_model_and_metrics(selected_method: str, selected_weeks: int):
+def get_model_and_metrics(selected_method: str, selected_weeks: int, training_version=2):
     # Metrics include the historical 80% price margin.
     return train_model(get_data(), method=selected_method, horizon_weeks=selected_weeks)
 
 
 @st.cache_resource
-def get_rolling_metrics(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data=None):
+def get_rolling_metrics(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data=None, training_version=2):
     return rolling_backtest(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data)
 
 
@@ -147,7 +147,7 @@ def show_evaluation(model_metrics):
     )
     st.caption(
         f"Bitcoin-historik: {model_metrics['data_start']:%Y-%m-%d} – {model_metrics['data_end']:%Y-%m-%d}. "
-        f"Slutmodellen tränas om på alla {model_metrics['n_production']} kompletta exempel: "
+        f"Slutmodellen tränas om på {model_metrics['n_production']} kompletta exempel i vald historik: "
         f"{model_metrics['production_train_start']:%Y-%m-%d} – {model_metrics['production_train_end']:%Y-%m-%d}, "
         f"med kända utfall till {model_metrics['production_target_end']:%Y-%m-%d}."
     )
@@ -157,6 +157,13 @@ def show_evaluation(model_metrics):
         f"{model_metrics['test_target_end']:%Y-%m-%d} ({model_metrics['n_test']} exempel). "
         "Testperioden är inte slutmodellens hela träningsperiod."
     )
+    history = model_metrics.get("history_weeks")
+    label = "hela historiken" if history is None else f"upp till {history // 52} år"
+    st.caption(f"Modellen använder {label}. Historikfönstret slutar vid senaste träningsexemplet med känt utfall.")
+    if model_metrics["tuned"]:
+        st.caption("Historiklängd och modellens parametrar väljs gemensamt på valideringsdata. Sluttestet används inte för valet.")
+    else:
+        st.caption("För lite historik för validering: hela historiken och standardinställningar används utan optimering.")
 
 
 df = get_data()
@@ -248,14 +255,12 @@ with st.expander("Om modellen"):
         1. Ett par hyperparameter-kandidater tränas på träningsdelen och jämförs på
            valideringsdelen – bästa valet: `{metrics['best_params'] or "standardvärden"}`
            (val-RMSE: {metrics['val_rmse']:.1f}).
-        2. De vinnande hyperparametrarna tränas om på träning+validering och testas en
+        2. Den valda konfigurationen tränas om på träning+validering inom vald historiklängd och testas en
            **enda gång** på den helt osedda testdelen – det är detta som rapporteras
            nedan som modellens riktiga prestanda.
         3. Den modell som faktiskt gör prognosen ovan tränas därefter om en sista gång
-           på **all** tillgänglig data (träning+validering+test), så att prognosen får
-           utnyttja så mycket historik som möjligt. Testdelens enda syfte är att ge en
-           ärlig uppskattning av träffsäkerheten – inte att vara med i den slutliga
-           prognosmodellen.
+           på kompletta exempel inom **vald historiklängd**. Testutfallen ingår först
+           efter utvärderingen.
         """
     else:
         methodology = f"""

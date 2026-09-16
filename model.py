@@ -5,7 +5,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -42,6 +42,7 @@ FEATURE_COLUMNS = [
 # harmlöst för de trädbaserade metoderna.
 METHODS = {
     "Linjär regression": lambda: make_pipeline(StandardScaler(), LinearRegression()),
+    "Ridge": lambda: make_pipeline(StandardScaler(), Ridge()),
     "SVR": lambda: make_pipeline(StandardScaler(), SVR(kernel="rbf", C=10, epsilon=0.01)),
     "Random Forest": lambda: make_pipeline(
         StandardScaler(), RandomForestRegressor(n_estimators=300, random_state=42)
@@ -56,6 +57,15 @@ METHODS = {
 # när fyra metoder x flera horisonter tränas om i appen.
 PARAM_GRIDS = {
     "Linjär regression": [{}],
+    "Ridge": [
+        {"ridge__alpha": 0.1},
+        {"ridge__alpha": 1.0},
+        {"ridge__alpha": 10.0},
+        {"ridge__alpha": 100.0},
+        {"ridge__alpha": 300.0},
+        {"ridge__alpha": 1000.0},
+        {"ridge__alpha": 3000.0},
+    ],
     "SVR": [
         {"svr__C": 1, "svr__epsilon": 0.01},
         {"svr__C": 10, "svr__epsilon": 0.01},
@@ -84,6 +94,8 @@ FORECAST_HORIZONS = {
 def _model_path(method: str, horizon_weeks: int, include_macro: bool = False) -> Path:
     slug = method.lower().replace(" ", "_").replace("ä", "a").replace("ö", "o")
     prefix = "model_v4_macro_v1" if include_macro else "model_v4"
+    if method == "Ridge":
+        prefix += "_history_v2"
     return MODEL_DIR / f"{prefix}_{slug}_{horizon_weeks}w.pkl"
 
 
@@ -136,6 +148,37 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1, macro_df: pd.DataFr
 
 
 MIN_EVAL_ROWS = 8  # minsta antal rader vi accepterar i en tränings-/valideringsdel
+
+
+def _training_window(rows, weeks):
+    """Calendar window ending at the latest eligible training example's origin.
+
+    Features are built before filtering. A year here is 52 weeks; the horizon
+    separates the latest eligible example from the current forecast date.
+    """
+    if weeks is None or rows.empty:
+        return rows
+    return rows.loc[rows["date"] > rows["date"].max() - pd.Timedelta(weeks=weeks)]
+
+
+def _select_configuration(method, train, validation, columns, min_rows=MIN_EVAL_ROWS):
+    # Alla metoder får samma historikalternativ så jämförelsen blir rättvis.
+    windows = (None, 208, 416)
+    best_params, best_window, best_score = None, None, np.inf
+    scores = []
+    for weeks in windows:
+        selected = _training_window(train, weeks)
+        if len(selected) < min_rows:
+            continue
+        for params in PARAM_GRIDS[method]:
+            candidate = METHODS[method]().set_params(**params)
+            candidate.fit(selected[columns], selected["target_return"])
+            score = _price_rmse(validation, candidate.predict(validation[columns]))
+            scores.append({"params": params.copy(), "history_weeks": weeks,
+                           "n_train": len(selected), "val_rmse": score})
+            if score < best_score:
+                best_params, best_window, best_score = params.copy(), weeks, score
+    return best_params, best_window, best_score, scores
 
 
 def historical_price_margin(actual_price, predicted_price) -> float | None:
@@ -229,19 +272,14 @@ def train_model(
         raise ValueError("För lite komplett historik för vald modell och horisont.")
 
     split = _three_way_split(feat, val_size, test_size, horizon_weeks)
+    history_weeks, validation_scores = None, []
     if split is not None:
         train, val, test = split
-        best_params, best_val_rmse = None, np.inf
-        for params in PARAM_GRIDS[method]:
-            candidate = METHODS[method]()
-            if params:
-                candidate.set_params(**params)
-            candidate.fit(train[feature_columns], train["target_return"])
-            val_rmse = _price_rmse(val, candidate.predict(val[feature_columns]))
-            if val_rmse < best_val_rmse:
-                best_val_rmse, best_params = val_rmse, params
+        best_params, history_weeks, best_val_rmse, validation_scores = _select_configuration(
+            method, train, val, feature_columns
+        )
         train_for_eval = pd.concat([train, val])
-        n_train, n_val, tuned = len(train), len(val), True
+        n_train, n_val, tuned = len(_training_window(train, history_weeks)), len(val), True
     else:
         n = len(feat)
         test_rows = max(int(n * test_size), 2)
@@ -254,6 +292,8 @@ def train_model(
 
     # Sluttest: den vinnande (eller, om tuning inte var möjlig, standard-) konfigurationen
     # tränas om på train_for_eval och utvärderas en enda gång på den helt osedda testdelen.
+    train_for_eval = _training_window(train_for_eval, history_weeks)
+    production_rows = _training_window(feat, history_weeks)
     eval_model = METHODS[method]()
     if best_params:
         eval_model.set_params(**best_params)
@@ -270,6 +310,9 @@ def train_model(
         "horizon_weeks": horizon_weeks,
         "tuned": tuned,
         "best_params": best_params,
+        "history_weeks": history_weeks,
+        "validation_scores": validation_scores,
+        "n_eval_train": len(train_for_eval),
         "val_rmse": best_val_rmse,
         "mae": mean_absolute_error(actual_price, pred_price),
         "rmse": np.sqrt(mean_squared_error(actual_price, pred_price)),
@@ -286,10 +329,10 @@ def train_model(
         "test_target_end": test["target_date"].max(),
         "data_start": pd.to_datetime(df["date"]).min(),
         "data_end": pd.to_datetime(df["date"]).max(),
-        "production_train_start": feat["date"].min(),
-        "production_train_end": feat["date"].max(),
-        "production_target_end": feat["target_date"].max(),
-        "n_production": len(feat),
+        "production_train_start": production_rows["date"].min(),
+        "production_train_end": production_rows["date"].max(),
+        "production_target_end": production_rows["target_date"].max(),
+        "n_production": len(production_rows),
         "return_rmse_pct": float(np.sqrt(mean_squared_error(test["target_return"], pred_return)) * 100),
     }
 
@@ -297,7 +340,7 @@ def train_model(
     production_model = METHODS[method]()
     if best_params:
         production_model.set_params(**best_params)
-    production_model.fit(feat[feature_columns], feat["target_return"])
+    production_model.fit(production_rows[feature_columns], production_rows["target_return"])
 
     joblib.dump(production_model, _model_path(method, horizon_weeks, macro_df is not None))
     return production_model, metrics
@@ -335,18 +378,16 @@ def rolling_backtest(
         if len(known) < min_train_rows:
             continue
         params = {}
+        history_weeks = None
         val_count = max(MIN_EVAL_ROWS, int(len(known) * 0.2))
         validation = known.iloc[-val_count:]
         inner_train = known.loc[known["target_date"] < validation["date"].iloc[0]]
         tuned = len(inner_train) >= min_train_rows
         if tuned:
-            best_score = np.inf
-            for candidate_params in PARAM_GRIDS[method]:
-                candidate = METHODS[method]().set_params(**candidate_params)
-                candidate.fit(inner_train[columns], inner_train["target_return"])
-                score = _price_rmse(validation, candidate.predict(validation[columns]))
-                if score < best_score:
-                    best_score, params = score, candidate_params
+            params, history_weeks, _, _ = _select_configuration(
+                method, inner_train, validation, columns, min_train_rows
+            )
+        known = _training_window(known, history_weeks)
         estimator = METHODS[method]().set_params(**params)
         estimator.fit(known[columns], known["target_return"])
         inputs = feat.loc[[row.name], columns]
@@ -358,6 +399,7 @@ def rolling_backtest(
             "predicted_price": row["price"] * (1 + predicted_return),
             "actual_return": row["target_return"], "predicted_return": predicted_return,
             "tuned": tuned,
+            "history_weeks": history_weeks, "best_params": params.copy(),
         })
         next_origin = origin + pd.Timedelta(weeks=step_weeks)
     result = {"predictions": pd.DataFrame(records), "n_test": len(records),

@@ -78,6 +78,59 @@ def test_feature_columns_excludes_duplicate_return():
     assert "weeks_to_halving" in FEATURE_COLUMNS
 
 
+def test_ridge_selects_alpha_on_validation_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_module, "MODEL_DIR", tmp_path)
+    frame = make_price_frame(900)
+    features = build_features(frame, 4).dropna(subset=FEATURE_COLUMNS + ["target_return"])
+    train, validation, _ = model_module._three_way_split(features, 0.2, 0.2, 4)
+    scores = []
+    configurations = []
+    for weeks in (None, 208, 416):
+        selected = train if weeks is None else train.loc[train.date > train.date.max() - pd.Timedelta(weeks=weeks)]
+        for params in model_module.PARAM_GRIDS["Ridge"]:
+            candidate = model_module.METHODS["Ridge"]().set_params(**params)
+            candidate.fit(selected[FEATURE_COLUMNS], selected.target_return)
+            prediction = validation.price.to_numpy() * (1 + candidate.predict(validation[FEATURE_COLUMNS]))
+            scores.append(np.sqrt(np.mean((validation.target_price.to_numpy() - prediction) ** 2)))
+            configurations.append((params, weeks))
+    trained, metrics = train_model(frame, method="Ridge", horizon_weeks=4)
+    expected, history = configurations[int(np.argmin(scores))]
+    assert metrics["history_weeks"] == history
+    assert len(metrics["validation_scores"]) == 21
+    assert metrics["best_params"] == expected
+    assert trained.named_steps["ridge"].alpha == expected["ridge__alpha"]
+    assert metrics["val_rmse"] == pytest.approx(min(scores))
+    loaded = model_module.load_model("Ridge", 4)
+    assert predict_price(frame, loaded, horizon_weeks=4) == pytest.approx(
+        predict_price(frame, trained, horizon_weeks=4)
+    )
+    expected_rows = features if history is None else features.loc[features.date > features.date.max() - pd.Timedelta(weeks=history)]
+    assert metrics["n_production"] == len(expected_rows)
+    assert trained.named_steps["standardscaler"].n_samples_seen_ == len(expected_rows)
+    changed = frame.copy()
+    changed.loc[changed.date >= metrics["test_start"], "price"] *= 3
+    _, rerun = train_model(changed, method="Ridge", horizon_weeks=4)
+    assert rerun["best_params"] == metrics["best_params"]
+    assert rerun["history_weeks"] == history
+    assert rerun["val_rmse"] == pytest.approx(metrics["val_rmse"])
+
+
+def test_training_window_uses_calendar_dates_with_missing_rows():
+    frame = make_price_frame(500).drop(index=range(350, 380))
+    selected = model_module._training_window(frame, 208)
+    assert selected.date.min() > frame.date.max() - pd.Timedelta(weeks=208)
+    assert len(selected) == 178
+
+
+def test_ridge_fallback_uses_all_history_and_default_alpha(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_module, "MODEL_DIR", tmp_path)
+    trained, metrics = train_model(make_price_frame(220), method="Ridge", horizon_weeks=52)
+    assert not metrics["tuned"]
+    assert metrics["history_weeks"] is None
+    assert metrics["validation_scores"] == []
+    assert trained.named_steps["ridge"].alpha == 1
+
+
 def test_weeks_to_halving_counts_down_and_resets():
     dates = pd.to_datetime(["2024-04-13", "2024-04-20", "2024-04-27"])
     features = build_features(pd.DataFrame({"date": dates, "price": [100, 101, 102]}))
