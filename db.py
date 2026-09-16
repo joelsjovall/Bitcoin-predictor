@@ -3,6 +3,7 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 DB_PATH = Path(__file__).parent / "bitcoin.db"
 CSV_PATH = Path(__file__).parent / "Bitcoin Empirisk data.csv"
@@ -46,6 +47,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
             date TEXT PRIMARY KEY,
             price REAL,
             pct_change REAL
+            ,volume REAL
         )
         """
     table_exists = conn.execute(
@@ -62,7 +64,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
         conn.execute(schema_sql)
 
         old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
-        copy_columns = [column for column in ["date", "price", "pct_change"] if column in old_columns]
+        copy_columns = [column for column in ["date", "price", "pct_change", "volume"] if column in old_columns]
         if copy_columns:
             columns_sql = ", ".join(copy_columns)
             conn.execute(
@@ -74,6 +76,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 """
             )
         conn.execute("DROP TABLE prices_old")
+    current_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices)").fetchall()}
+    if current_columns and "volume" not in current_columns:
+        conn.execute("ALTER TABLE prices ADD COLUMN volume REAL")
 
     conn.commit()
     conn.close()
@@ -90,6 +95,7 @@ def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("DELETE FROM prices")
+    df = df.assign(volume=None)
     df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_sql(
         "prices", conn, if_exists="append", index=False
     )
@@ -114,12 +120,15 @@ def fetch_live_prices(start: str = "2011-09-15", interval: str = "1wk") -> pd.Da
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
-    df = raw.rename(columns={"Date": "date", "Close": "price"})[["date", "price"]]
+    raw["Volume"] = pd.to_numeric(raw["Volume"], errors="coerce") if "Volume" in raw else np.nan
+    raw["weekly_volume"] = raw["Volume"].rolling(7, min_periods=7).sum()
+    df = raw.rename(columns={"Date": "date", "Close": "price"})[["date", "price", "weekly_volume"]]
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
     df = df.loc[df["date"] < today].dropna(subset=["price"])
     # Ta endast faktiska söndagsstängningar; fyll inte luckor med äldre priser.
     df = df.loc[df["date"].dt.dayofweek == 6].sort_values("date").reset_index(drop=True)
+    df = df.rename(columns={"weekly_volume": "volume"})
     if df.empty:
         raise RuntimeError("Yahoo Finance returnerade inga avslutade söndagspriser.")
     df["pct_change"] = df["price"].pct_change(fill_method=None) * 100
@@ -139,12 +148,15 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2011-09-15", interval: st
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
+    for row in rows:
+        row.setdefault("volume", None)
     conn.executemany(
         """
-        INSERT INTO prices (date, price, pct_change)
-        VALUES (:date, :price, :pct_change)
+        INSERT INTO prices (date, price, pct_change, volume)
+        VALUES (:date, :price, :pct_change, :volume)
         ON CONFLICT(date) DO UPDATE SET
             price=excluded.price, pct_change=excluded.pct_change
+            ,volume=excluded.volume
         """,
         rows,
     )

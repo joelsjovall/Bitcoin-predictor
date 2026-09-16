@@ -36,6 +36,7 @@ FEATURE_COLUMNS = [
     "rolling_mean_return_4",
     "rolling_std_return_4",
 ]
+VOLUME_FEATURE_COLUMNS = ["volume_change_4w", "relative_volume_12w"]
 
 # Alla metoder tränas på samma features/target, se build_features(). Features skalas
 # (StandardScaler) eftersom SVR och linjär regression är känsliga för det, medan det är
@@ -139,6 +140,10 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1, macro_df: pd.DataFr
     out["ret_lag_3"] = ret.shift(3)
     out["rolling_mean_return_4"] = ret.shift(1).rolling(4).mean()
     out["rolling_std_return_4"] = ret.shift(1).rolling(4).std()
+    if "volume" in out and out["volume"].notna().any():
+        volume = pd.to_numeric(out["volume"], errors="coerce")
+        out["volume_change_4w"] = volume.pct_change(4, fill_method=None)
+        out["relative_volume_12w"] = volume / volume.rolling(12).mean().shift(1) - 1
     out["target_price"] = out["price"].shift(-horizon_weeks)
     out["target_date"] = out["date"].shift(-horizon_weeks)
     out["target_return"] = out["target_price"] / out["price"] - 1
@@ -266,7 +271,10 @@ def train_model(
     if not 0 < val_size < 1 or not 0 < test_size < 1 or val_size + test_size >= 1:
         raise ValueError("val_size och test_size måste vara mellan 0 och 1 och summera till mindre än 1.")
 
-    feature_columns = FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    # Volym sparas i databasen men används inte automatiskt: ett jämförande test
+    # visade högre fel med volym på den aktuella testperioden.
+    volume_columns = []
+    feature_columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
     feat = build_features(df, horizon_weeks, macro_df).dropna(subset=feature_columns + ["target_return"])
     if len(feat) < 3:
         raise ValueError("För lite komplett historik för vald modell och horisont.")
@@ -365,7 +373,8 @@ def rolling_backtest(
         raise ValueError("Okänd metod.")
     if not isinstance(step_weeks, int) or step_weeks < 1 or min_train_rows < MIN_EVAL_ROWS:
         raise ValueError("Ogiltigt teststeg eller för få träningsexempel.")
-    columns = FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    volume_columns = []
+    columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
     feat = build_features(df, horizon_weeks, macro_df).dropna(subset=columns + ["target_return"])
     eligible = feat.loc[feat["target_date"] < pd.Timestamp(holdout_start)]
     records = []
@@ -436,7 +445,8 @@ def predict_price(
     if model is None:
         model = load_model(method, horizon_weeks, macro_df)
 
-    feature_columns = FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    volume_columns = []
+    feature_columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
     feat = build_features(df, horizon_weeks, macro_df)
     latest = feat.iloc[[-1]]
     if latest[feature_columns].isna().any().any():

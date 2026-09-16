@@ -1,5 +1,10 @@
 # Bitcoin-predictor
 
+Volym hämtas och sparas i databasen för framtida experiment, men används för
+närvarande inte som modellfeature. Ett kontrollerat test på samma data gav högre
+Ridge-fel med volym (12 367 USD) än utan volym (10 532 USD). Volym ska aktiveras
+igen först efter jämförelse på samma testdatum och i rullande tester.
+
 ## Modellval
 
 Appen erbjuder linjär regression, Ridge, SVR, Random Forest och XGBoost.
