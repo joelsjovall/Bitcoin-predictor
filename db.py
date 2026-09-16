@@ -98,7 +98,7 @@ def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
     return len(df)
 
 
-def fetch_live_prices(start: str = "2021-09-15", interval: str = "1wk") -> pd.DataFrame:
+def fetch_live_prices(start: str = "2011-09-15", interval: str = "1wk") -> pd.DataFrame:
     """Hämtar BTC-USD-priser från Yahoo Finance från och med `start` till idag
     (samma schema som CSV-datan)."""
     import yfinance as yf
@@ -126,7 +126,7 @@ def fetch_live_prices(start: str = "2021-09-15", interval: str = "1wk") -> pd.Da
     return df
 
 
-def ingest_live(db_path: Path = DB_PATH, start: str = "2021-09-15", interval: str = "1wk") -> int:
+def ingest_live(db_path: Path = DB_PATH, start: str = "2011-09-15", interval: str = "1wk") -> int:
     """Hämtar data från Yahoo Finance (från `start` till idag) och skriver in den i
     databasen (uppdaterar matchande datum och behåller äldre CSV-historik).
     Returnerar antal rader som hämtades."""
