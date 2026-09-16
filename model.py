@@ -138,6 +138,24 @@ def build_features(df: pd.DataFrame, horizon_weeks: int = 1, macro_df: pd.DataFr
 MIN_EVAL_ROWS = 8  # minsta antal rader vi accepterar i en tränings-/valideringsdel
 
 
+def historical_price_margin(actual_price, predicted_price) -> float | None:
+    """80:e percentilen av absoluta testfel relativt prognospriset, i procent.
+
+    Avrunda uppåt till ett observerat fel så att minst 80 % täcks i testet.
+    Icke-positiva prognoser saknar en meningsfull relativ prisfelmarginal.
+    """
+    actual = np.asarray(actual_price, dtype=float)
+    predicted = np.asarray(predicted_price, dtype=float)
+    if (actual.size == 0 or actual.shape != predicted.shape
+            or not np.isfinite(actual).all() or not np.isfinite(predicted).all()
+            or (predicted <= 0).any()):
+        return None
+    errors = np.abs(actual - predicted) / predicted * 100
+    if not np.isfinite(errors).all():
+        return None
+    return float(np.quantile(errors, 0.8, method="higher"))
+
+
 def _price_rmse(rows: pd.DataFrame, pred_return: np.ndarray) -> float:
     pred_price = rows["price"].values * (1 + pred_return)
     return float(np.sqrt(mean_squared_error(rows["target_price"].values, pred_price)))
@@ -248,6 +266,7 @@ def train_model(
 
     metrics = {
         "method": method,
+        "historical_margin_pct": historical_price_margin(actual_price, pred_price),
         "horizon_weeks": horizon_weeks,
         "tuned": tuned,
         "best_params": best_params,
@@ -282,6 +301,77 @@ def train_model(
 
     joblib.dump(production_model, _model_path(method, horizon_weeks, macro_df is not None))
     return production_model, metrics
+
+
+def rolling_backtest(
+    df: pd.DataFrame,
+    method: str,
+    horizon_weeks: int,
+    holdout_start,
+    macro_df: pd.DataFrame | None = None,
+    step_weeks: int = 13,
+    min_train_rows: int = 104,
+):
+    """Expanding-window backtest, with all scored outcomes before the final holdout.
+
+    Refit at each origin. Tune only on outcomes known before that origin,
+    purging training targets that overlap the inner validation period.
+    Never reuse parameters chosen using later data or save these temporary models.
+    """
+    if method not in METHODS:
+        raise ValueError("Okänd metod.")
+    if not isinstance(step_weeks, int) or step_weeks < 1 or min_train_rows < MIN_EVAL_ROWS:
+        raise ValueError("Ogiltigt teststeg eller för få träningsexempel.")
+    columns = FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    feat = build_features(df, horizon_weeks, macro_df).dropna(subset=columns + ["target_return"])
+    eligible = feat.loc[feat["target_date"] < pd.Timestamp(holdout_start)]
+    records = []
+    next_origin = None
+    for _, row in eligible.iterrows():
+        origin = row["date"]
+        if next_origin is not None and origin < next_origin:
+            continue
+        known = feat.loc[feat["target_date"] < origin]
+        if len(known) < min_train_rows:
+            continue
+        params = {}
+        val_count = max(MIN_EVAL_ROWS, int(len(known) * 0.2))
+        validation = known.iloc[-val_count:]
+        inner_train = known.loc[known["target_date"] < validation["date"].iloc[0]]
+        tuned = len(inner_train) >= min_train_rows
+        if tuned:
+            best_score = np.inf
+            for candidate_params in PARAM_GRIDS[method]:
+                candidate = METHODS[method]().set_params(**candidate_params)
+                candidate.fit(inner_train[columns], inner_train["target_return"])
+                score = _price_rmse(validation, candidate.predict(validation[columns]))
+                if score < best_score:
+                    best_score, params = score, candidate_params
+        estimator = METHODS[method]().set_params(**params)
+        estimator.fit(known[columns], known["target_return"])
+        inputs = feat.loc[[row.name], columns]
+        predicted_return = float(estimator.predict(inputs)[0])
+        records.append({
+            "date": origin, "target_date": row["target_date"],
+            "train_target_end": known["target_date"].max(), "n_train": len(known),
+            "price": row["price"], "actual_price": row["target_price"],
+            "predicted_price": row["price"] * (1 + predicted_return),
+            "actual_return": row["target_return"], "predicted_return": predicted_return,
+            "tuned": tuned,
+        })
+        next_origin = origin + pd.Timedelta(weeks=step_weeks)
+    result = {"predictions": pd.DataFrame(records), "n_test": len(records),
+              "step_weeks": step_weeks, "min_train_rows": min_train_rows}
+    if not records:
+        return result
+    rows = result["predictions"]
+    result.update({
+        "rmse": float(np.sqrt(mean_squared_error(rows.actual_price, rows.predicted_price))),
+        "naive_rmse": float(np.sqrt(mean_squared_error(rows.actual_price, rows.price))),
+        "return_rmse_pct": float(np.sqrt(mean_squared_error(rows.actual_return, rows.predicted_return)) * 100),
+        "historical_margin_pct": historical_price_margin(rows.actual_price, rows.predicted_price),
+    })
+    return result
 
 
 def load_model(method: str = "Random Forest", horizon_weeks: int = 1, macro_df: pd.DataFrame | None = None):

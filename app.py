@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import ingest_csv, ingest_live, load_prices_df
-from model import FORECAST_HORIZONS, METHODS, predict_price, train_model
+from model import FORECAST_HORIZONS, METHODS, predict_price, train_model, rolling_backtest
 from macro import MACRO_FEATURE_COLUMNS, build_macro_features, fetch_macro_prices
 
 st.set_page_config(page_title="Bitcoin – pris & prognos", layout="wide")
@@ -58,22 +58,92 @@ def get_macro_data(start: str) -> pd.DataFrame:
 
 @st.cache_resource
 def get_macro_model_and_metrics(selected_method: str, selected_weeks: int, bitcoin_data: pd.DataFrame, macro_data: pd.DataFrame):
+    # Metrics include the historical 80% price margin.
     return train_model(bitcoin_data, method=selected_method, horizon_weeks=selected_weeks, macro_df=macro_data)
 
 
 @st.cache_resource
 def get_model_and_metrics(selected_method: str, selected_weeks: int):
+    # Metrics include the historical 80% price margin.
     return train_model(get_data(), method=selected_method, horizon_weeks=selected_weeks)
 
 
+@st.cache_resource
+def get_rolling_metrics(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data=None):
+    return rolling_backtest(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data)
+
+
+def show_rolling_evaluation(bitcoin_data, selected_method, selected_weeks, model_metrics, prediction, macro_data=None):
+    st.subheader("Rullande tester över tidigare historik")
+    latest = bitcoin_data.sort_values("date").iloc[-1]
+    target_date = pd.Timestamp(latest["date"]) + pd.Timedelta(weeks=selected_weeks)
+    forecast_name = "Bitcoin + makro" if macro_data is not None else "Bitcoin"
+    st.metric(
+        f"Prisprognos – {forecast_name} (rullande utvärdering)",
+        f"{prediction:,.0f} USD",
+        f"{(prediction / latest['price'] - 1) * 100:+.1f}%",
+    )
+    st.caption(
+        f"Prognosen gäller {target_date:%Y-%m-%d}, {selected_weeks} veckor efter senaste prisdatum. "
+        "Det är samma aktuella prognos från slutmodellen som ovan. Här bedöms felmarginalen "
+        "med rullande historiska tester; testerna skapar inte ett separat framtida prognospris."
+    )
+    with st.spinner("Tränar och testar vid historiska prognosdatum…"):
+        rolling = get_rolling_metrics(bitcoin_data, selected_method, selected_weeks, model_metrics["test_start"], macro_data)
+    st.caption(
+        "Ny träning och prognos var 13:e vecka, med minst 104 kompletta träningsexempel. "
+        "Bara redan kända utfall används; inställningar väljs på då tillgänglig valideringsdata "
+        "när den räcker, annars används standardinställningar. Alla testutfall ligger före senaste sluttestet."
+    )
+    if rolling["n_test"] < 2:
+        st.info("För lite tidigare historik för en sammanfattning av rullande tester vid denna horisont. Senaste sluttestet visas ovan.")
+        return
+    rows = rolling["predictions"]
+    st.caption(
+        f"{len(rows)} prognoser från {rows.date.min():%Y-%m-%d} till {rows.date.max():%Y-%m-%d}. "
+        f"Utfall: {rows.target_date.min():%Y-%m-%d} – {rows.target_date.max():%Y-%m-%d}. "
+        "Överlappande prognoser är inte oberoende cykler; långa horisonter ger färre testmöjligheter."
+    )
+    if len(rows) < 20:
+        st.caption("Få historiska prognoser: felmarginalen är ett osäkert underlag.")
+    st.metric("RMSE (rullande, USD)", f"{rolling['rmse']:,.0f}",
+              help=f"Oförändrat pris: {rolling['naive_rmse']:,.0f} USD")
+    show_historical_margin(prediction, rolling, "rullande tester")
+    with st.expander("Historiska prognoser och faktiska utfall"):
+        chart = go.Figure()
+        chart.add_trace(go.Scatter(x=rows.target_date, y=rows.actual_price, name="Faktiskt pris"))
+        chart.add_trace(go.Scatter(x=rows.target_date, y=rows.predicted_price, name="Historisk prognos"))
+        chart.update_layout(xaxis_title="Datum för utfallet", yaxis_title="Pris (USD)")
+        st.plotly_chart(chart, width="stretch")
+        st.dataframe(rows[["date", "target_date", "predicted_price", "actual_price", "n_train", "tuned"]].rename(columns={
+            "date": "Prognosdatum", "target_date": "Utfallsdatum", "predicted_price": "Prognos (USD)",
+            "actual_price": "Utfall (USD)", "n_train": "Träningsexempel", "tuned": "Inställningar validerade",
+        }), hide_index=True, width="stretch")
+
+
+def show_historical_margin(prediction, model_metrics, source="senaste sluttestet"):
+    margin = model_metrics["historical_margin_pct"]
+    if margin is None or not 0 < prediction < float("inf"):
+        st.info("Historisk felmarginal kan inte visas eftersom en prognos saknar ett giltigt positivt pris.")
+        return
+    low = max(0, prediction * (1 - margin / 100))
+    high = prediction * (1 + margin / 100)
+    error_col, interval_col = st.columns(2)
+    error_col.metric(f"Historisk felmarginal (80 %, {source})", f"±{margin:.1f} %")
+    interval_col.metric("Prisintervall utifrån historiska fel", f"{low:,.0f}–{high:,.0f} USD")
+    st.caption(
+        f"Minst 8 av 10 prognoser i {source} låg inom denna procentuella avvikelse från utfallet, "
+        "räknat i procent av prognospriset. Felmarginalen gäller den valda modellen och tidshorisonten. "
+        "Historiska fel kan vara större; intervallet är ingen garanti för nästa utfall."
+    )
+    if margin > 100:
+        st.caption("Intervallets nedre gräns visas som 0 USD eftersom felmarginalen överstiger 100 %.")
+
+
 def show_evaluation(model_metrics):
-    price_error, return_error = st.columns(2)
-    price_error.metric(
+    st.metric(
         "RMSE (test, USD)", f"{model_metrics['rmse']:,.0f}",
         help=f"Naiv RMSE (oförändrat pris): {model_metrics['naive_rmse']:,.0f} USD",
-    )
-    return_error.metric(
-        "RMSE (test, avkastning i procentenheter)", f"{model_metrics['return_rmse_pct']:.2f}",
     )
     st.caption(
         f"Bitcoin-historik: {model_metrics['data_start']:%Y-%m-%d} – {model_metrics['data_end']:%Y-%m-%d}. "
@@ -117,7 +187,9 @@ else:
 col1, col2 = st.columns(2)
 col1.metric("Senaste pris", f"{last_row['price']:,.0f}", help=str(last_row["date"].date()))
 col2.metric(f"Prognos om {horizon_label}", f"{next_price:,.0f}", f"{change_pct:+.1f}%")
+show_historical_margin(next_price, metrics)
 show_evaluation(metrics)
+show_rolling_evaluation(df, method, weeks_ahead, metrics, next_price)
 st.info(
     f"Prognoserna utgår från senaste Bitcoin-observationen {last_row['date']:%Y-%m-%d} "
     f"och gäller {forecast_date:%Y-%m-%d}. Träning kräver ett känt utfall {weeks_ahead} veckor senare; "
@@ -235,7 +307,9 @@ try:
         macro_price = predict_price(df, macro_model, horizon_weeks=weeks_ahead, macro_df=macro_data)
     macro_change_pct = (macro_price / last_row["price"] - 1) * 100
     st.metric(f"Makroprognos om {horizon_label}", f"{macro_price:,.0f} USD", f"{macro_change_pct:+.1f}%")
+    show_historical_margin(macro_price, macro_metrics)
     show_evaluation(macro_metrics)
+    show_rolling_evaluation(df, method, weeks_ahead, macro_metrics, macro_price, macro_data)
     macro_fig = go.Figure()
     macro_fig.add_trace(go.Scatter(x=df["date"], y=df["price"], name="Bitcoin-pris", mode="lines"))
     macro_fig.add_trace(go.Scatter(
