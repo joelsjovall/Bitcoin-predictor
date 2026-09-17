@@ -67,17 +67,19 @@ def test_missing_macro_not_filled_from_future_or_stale_values():
 
 
 @pytest.mark.parametrize("horizon", model_module.FORECAST_HORIZONS.values())
-def test_macro_training_prediction_and_separate_files(tmp_path, monkeypatch, horizon):
+@pytest.mark.parametrize("method", ["Linjär regression", "Ridge"])
+def test_macro_training_prediction_and_separate_files(tmp_path, monkeypatch, horizon, method):
     monkeypatch.setattr(model_module, "MODEL_DIR", tmp_path)
     bitcoin, macro = make_frames()
-    baseline_path = model_module._model_path("Linjär regression", horizon)
+    baseline_path = model_module._model_path(method, horizon)
     baseline_path.write_bytes(b"unchanged")
-    trained, metrics = train_model(bitcoin, method="Linjär regression", horizon_weeks=horizon, macro_df=macro)
+    trained, metrics = train_model(bitcoin, method=method, horizon_weeks=horizon, macro_df=macro)
     assert list(trained.feature_names_in_) == FEATURE_COLUMNS + MACRO_FEATURE_COLUMNS
-    assert model_module._model_path("Linjär regression", horizon, True).exists()
+    assert model_module._model_path(method, horizon, True).exists()
     assert baseline_path.read_bytes() == b"unchanged"
     assert np.isfinite(metrics["return_rmse_pct"])
     complete = build_features(bitcoin, horizon, macro).dropna(subset=FEATURE_COLUMNS + MACRO_FEATURE_COLUMNS + ["target_return"])
+    complete = model_module._training_window(complete, metrics["history_weeks"])
     assert metrics["n_production"] == len(complete)
     assert trained.named_steps["standardscaler"].n_samples_seen_ == len(complete)
     assert metrics["production_target_end"] == bitcoin.date.max()

@@ -9,6 +9,20 @@ def prices():
     return pd.DataFrame({"date": dates, "price": 100 + np.arange(780) + 10 * np.sin(np.arange(780) / 9)})
 
 
+def test_ridge_rolling_backtest_tunes_without_saving_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "MODEL_DIR", tmp_path)
+    frame = prices()
+    cutoff = frame.date.iloc[400]
+    result = module.rolling_backtest(frame, "Ridge", 4, cutoff, step_weeks=52)
+    rows = result["predictions"]
+    assert result["n_test"] > 1
+    assert rows.tuned.any()
+    assert np.isfinite(rows.predicted_price).all()
+    assert (rows.train_target_end < rows.date).all()
+    assert (rows.target_date < cutoff).all()
+    assert not list(tmp_path.glob("*.pkl"))
+
+
 def test_rolling_all_fits_precede_prediction_including_inner_validation(monkeypatch):
     df = prices()
     horizon = 52

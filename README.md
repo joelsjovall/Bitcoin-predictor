@@ -1,5 +1,30 @@
 # Bitcoin-predictor
 
+Volym hämtas och sparas i databasen för framtida experiment, men används för
+närvarande inte som modellfeature. Ett kontrollerat test på samma data gav högre
+Ridge-fel med volym (12 367 USD) än utan volym (10 532 USD). Volym ska aktiveras
+igen först efter jämförelse på samma testdatum och i rullande tester.
+
+## Modellval
+
+Appen erbjuder linjär regression, Ridge, SVR, Random Forest och XGBoost.
+Ridge använder standardiserade faktorer och L2-regularisering. Styrkan `alpha`
+väljs bland 0.1, 1, 10, 100, 300, 1000 och 3000 via validerings-RMSE, inte sluttestet.
+För varje metod väljs samtidigt hela historiken eller ett fönster på upp till 208/416 veckor
+(fyra/åtta år). Alla kandidater bedöms på samma valideringsdatum. Faktorerna
+beräknas före avgränsningen. Fönstret räknas bakåt från senaste tillgängliga
+träningsexemplets prognosdatum, inte från dagens datum; dess utfall måste vara känt.
+Vald längd används även vid sluttest och omträning för den aktuella prognosen.
+Vid lika resultat behålls första alternativet, hela historiken.
+Rullande tester väljer på nytt vid varje tidpunkt med endast då kända utfall.
+Appen visar vald historiklängd för alla modeller.
+Ridge fungerar med både Bitcoin-faktorer och makrodata samt i rullande tester.
+Om historiken inte räcker för validering används hela historiken och `alpha=1`.
+Modellfilerna använder versionsprefixet `history_v2` för att inte läsa äldre
+modeller som tränats med annan historiklängd.
+Jämför testresultaten med oförändrat pris; Ridge garanterar inte lägre fel.
+Starta om Streamlit efter att det nya modellvalet lagts till.
+
 ## Två prognosmodeller
 
 Graf 1 behåller Bitcoin-modellen och dess `FEATURE_COLUMNS`. Graf 2 använder
