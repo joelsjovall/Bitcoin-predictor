@@ -56,14 +56,16 @@ def get_data() -> pd.DataFrame:
 
 def ensure_fresh_data() -> tuple[pd.DataFrame, str | None]:
     """Hämtar automatiskt senaste Bitcoin-pris vid sidladdning om lagrad data är äldre än
-    senaste avslutade vecka (datan är veckovis, se build_features). Återanvänder samma
-    ingest_live() som den manuella live-knappen och rensar samma cachar vid lyckad hämtning.
-    Misslyckas hämtningen (t.ex. inget nätverk eller Yahoo Finance svarar inte) faller appen
-    tyst tillbaka på senast sparade data i databasen/CSV:n istället för att krascha.
+    gårdagens datum (dvs. varje gång en nyare handelsdag kan finnas tillgänglig, inte bara
+    en gång i veckan). Återanvänder samma ingest_live() som den manuella live-knappen och
+    rensar samma cachar vid lyckad hämtning. Misslyckas hämtningen (t.ex. inget nätverk
+    eller Yahoo Finance svarar inte) faller appen tyst tillbaka på senast sparade data i
+    databasen/CSV:n istället för att krascha.
     """
     data = get_data()
     latest_date = pd.to_datetime(data["date"]).max()
-    if pd.Timestamp.now().normalize() - latest_date <= pd.Timedelta(days=7):
+    today = pd.Timestamp.now().normalize()
+    if latest_date >= today - pd.Timedelta(days=1):
         return data, None
     try:
         ingest_live()
@@ -72,6 +74,24 @@ def ensure_fresh_data() -> tuple[pd.DataFrame, str | None]:
     st.cache_data.clear()
     st.cache_resource.clear()
     return get_data(), None
+
+
+@st.cache_data(ttl=20 * 60)  # 20 minuter – färskt utan onödiga anrop mot Yahoo Finance
+def get_current_price() -> float:
+    """Hämtar dagens senaste BTC-USD-pris direkt via yfinance, enbart för visning.
+
+    Helt fristående från prices-tabellen och modellens tränings-/testdata (samma dagliga
+    Yahoo Finance-data som fetch_live_prices() i db.py redan hämtar internt innan den
+    filtreras ner till söndagar – här visas den istället för att kastas bort).
+    """
+    import yfinance as yf
+
+    raw = yf.download("BTC-USD", period="5d", interval="1d", progress=False, auto_adjust=False)
+    if raw.empty:
+        raise RuntimeError("Yahoo Finance returnerade inga priser.")
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    return float(raw["Close"].dropna().iloc[-1])
 
 
 @st.cache_data(ttl=3600)
@@ -225,8 +245,26 @@ else:
         f"(RMSE {best_rmse:,.0f} mot {metrics['rmse']:,.0f} för {method})"
     )
 
-col1, col2 = st.columns(2)
-col1.metric("Senaste pris", f"{last_row['price']:,.0f}", help=str(last_row["date"].date()))
+try:
+    current_price = get_current_price()
+except Exception:
+    current_price = None
+
+col1, col_now, col2 = st.columns(3)
+col1.metric(
+    "Senaste pris (vecka)",
+    f"{last_row['price']:,.0f}",
+    help=f"Veckosnapshotet från {last_row['date'].date()} som modellen tränas och testas på.",
+)
+if current_price is not None:
+    col_now.metric(
+        "Pris just nu (idag)",
+        f"{current_price:,.0f}",
+        help="Dagens faktiska Bitcoin-pris, hämtat live. Rent visuellt – påverkar inte modellens "
+             "träning, prognoser eller RMSE-beräkningar.",
+    )
+else:
+    col_now.caption("Kunde inte hämta dagens pris just nu.")
 col2.metric(f"Prognos om {horizon_label}", f"{next_price:,.0f}", f"{change_pct:+.1f}%")
 show_historical_margin(next_price, metrics)
 show_evaluation(metrics)
