@@ -46,9 +46,32 @@ if horizon_label is None:
 weeks_ahead = FORECAST_HORIZONS[horizon_label]
 
 
-@st.cache_data
+AUTO_UPDATE_TTL_SECONDS = 3 * 60 * 60  # 3 timmar – färskt nog utan att hämta om vid varje interaktion
+
+
+@st.cache_data(ttl=AUTO_UPDATE_TTL_SECONDS)
 def get_data() -> pd.DataFrame:
     return load_prices_df()
+
+
+def ensure_fresh_data() -> tuple[pd.DataFrame, str | None]:
+    """Hämtar automatiskt senaste Bitcoin-pris vid sidladdning om lagrad data är äldre än
+    senaste avslutade vecka (datan är veckovis, se build_features). Återanvänder samma
+    ingest_live() som den manuella live-knappen och rensar samma cachar vid lyckad hämtning.
+    Misslyckas hämtningen (t.ex. inget nätverk eller Yahoo Finance svarar inte) faller appen
+    tyst tillbaka på senast sparade data i databasen/CSV:n istället för att krascha.
+    """
+    data = get_data()
+    latest_date = pd.to_datetime(data["date"]).max()
+    if pd.Timestamp.now().normalize() - latest_date <= pd.Timedelta(days=7):
+        return data, None
+    try:
+        ingest_live()
+    except Exception:
+        return data, "Automatisk live-uppdatering misslyckades just nu – visar senast sparade data."
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    return get_data(), None
 
 
 @st.cache_data(ttl=3600)
@@ -175,13 +198,15 @@ def show_evaluation(model_metrics):
         st.caption("För lite historik för validering: hela historiken och standardinställningar används utan optimering.")
 
 
-df = get_data()
+df, auto_update_error = ensure_fresh_data()
 latest_date = pd.to_datetime(df["date"]).max()
 if pd.Timestamp.now().normalize() - latest_date > pd.Timedelta(days=7):
     st.warning(
         f"Senaste Bitcoin-observation är {latest_date:%Y-%m-%d}. "
         "Välj Hämta senaste data (live) i sidopanelen för att uppdatera till senaste avslutade vecka."
     )
+if auto_update_error:
+    st.caption(f"ℹ️ {auto_update_error}")
 model, metrics = get_model_and_metrics(method, weeks_ahead)
 next_price = predict_price(df, model, horizon_weeks=weeks_ahead)
 last_row = df.iloc[-1]
