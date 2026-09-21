@@ -95,6 +95,15 @@ def show_rolling_evaluation(bitcoin_data, selected_method, selected_weeks, model
         "Bara redan kända utfall används; inställningar väljs på då tillgänglig valideringsdata "
         "när den räcker, annars används standardinställningar. Alla testutfall ligger före senaste sluttestet."
     )
+    if rolling["n_test"] == 0:
+        st.info(
+            "Ingen rullande utvärdering är möjlig för den här horisonten just nu – inte bara "
+            "tunt underlag, utan noll giltiga testcykler. Varje cykel kräver minst 104 kompletta "
+            "historiska exempel vars utfall redan är kända före senaste sluttestet, och med vår "
+            "nuvarande dataserie räcker historiken inte till det förrän om ungefär 3 år till. "
+            "Senaste sluttestet visas ovan istället."
+        )
+        return
     if rolling["n_test"] < 2:
         st.info("För lite tidigare historik för en sammanfattning av rullande tester vid denna horisont. Senaste sluttestet visas ovan.")
         return
