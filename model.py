@@ -204,8 +204,60 @@ def historical_price_margin(actual_price, predicted_price) -> float | None:
     return float(np.quantile(errors, 0.8, method="higher"))
 
 
+def price_interval_diagnostics(actual_price, predicted_price) -> dict:
+    """Kalibrera ett 80 %-intervall och kontrollera det på senare prognoser.
+
+    Både marginalen och procent-RMSE använder felet
+    ``(utfall - prognos) / prognos``. Vid minst tio observationer används de
+    äldsta 70 procenten för kalibrering och resten som en kronologiskt senare,
+    fristående kontroll av intervallets täckning.
+    """
+    actual = np.asarray(actual_price, dtype=float)
+    predicted = np.asarray(predicted_price, dtype=float)
+    valid = (actual.size > 0 and actual.shape == predicted.shape
+             and np.isfinite(actual).all() and np.isfinite(predicted).all()
+             and (predicted > 0).all())
+    if not valid:
+        return {
+            "historical_margin_pct": None,
+            "relative_price_rmse_pct": None,
+            "interval_coverage_pct": None,
+            "n_margin_calibration": 0,
+            "n_coverage_test": 0,
+        }
+
+    if actual.size >= 10:
+        calibration_count = min(int(np.ceil(actual.size * 0.7)), actual.size - 3)
+    else:
+        calibration_count = actual.size
+    calibration_actual = actual[:calibration_count]
+    calibration_predicted = predicted[:calibration_count]
+    calibration_errors = (calibration_actual - calibration_predicted) / calibration_predicted * 100
+    margin = historical_price_margin(calibration_actual, calibration_predicted)
+
+    coverage = None
+    coverage_count = actual.size - calibration_count
+    if coverage_count and margin is not None:
+        later_errors = np.abs((actual[calibration_count:] - predicted[calibration_count:])
+                              / predicted[calibration_count:] * 100)
+        coverage = float(np.mean(later_errors <= margin) * 100)
+
+    return {
+        "historical_margin_pct": margin,
+        "relative_price_rmse_pct": float(np.sqrt(np.mean(calibration_errors ** 2))),
+        "interval_coverage_pct": coverage,
+        "n_margin_calibration": calibration_count,
+        "n_coverage_test": coverage_count,
+    }
+
+
+def _prices_from_returns(start_price, predicted_return):
+    """Konvertera avkastningar till priser med 0 USD som ekonomiskt golv."""
+    return np.maximum(np.asarray(start_price) * (1 + np.asarray(predicted_return)), 0.0)
+
+
 def _price_rmse(rows: pd.DataFrame, pred_return: np.ndarray) -> float:
-    pred_price = rows["price"].values * (1 + pred_return)
+    pred_price = _prices_from_returns(rows["price"].values, pred_return)
     return float(np.sqrt(mean_squared_error(rows["target_price"].values, pred_price)))
 
 
@@ -308,13 +360,14 @@ def train_model(
     eval_model.fit(train_for_eval[feature_columns], train_for_eval["target_return"])
 
     pred_return = eval_model.predict(test[feature_columns])
-    pred_price = test["price"].values * (1 + pred_return)
+    pred_price = _prices_from_returns(test["price"].values, pred_return)
     actual_price = test["target_price"].values
     naive_price = test["price"].values  # baseline: priset om N veckor = samma som nu
 
+    interval_metrics = price_interval_diagnostics(actual_price, pred_price)
     metrics = {
         "method": method,
-        "historical_margin_pct": historical_price_margin(actual_price, pred_price),
+        **interval_metrics,
         "horizon_weeks": horizon_weeks,
         "tuned": tuned,
         "best_params": best_params,
@@ -354,82 +407,33 @@ def train_model(
     return production_model, metrics
 
 
-def rolling_backtest(
-    df: pd.DataFrame,
-    method: str,
-    horizon_weeks: int,
-    holdout_start,
-    macro_df: pd.DataFrame | None = None,
-    step_weeks: int = 13,
-    min_train_rows: int = 104,
-):
-    """Expanding-window backtest, with all scored outcomes before the final holdout.
-
-    Refit at each origin. Tune only on outcomes known before that origin,
-    purging training targets that overlap the inner validation period.
-    Never reuse parameters chosen using later data or save these temporary models.
-    """
-    if method not in METHODS:
-        raise ValueError("Okänd metod.")
-    if not isinstance(step_weeks, int) or step_weeks < 1 or min_train_rows < MIN_EVAL_ROWS:
-        raise ValueError("Ogiltigt teststeg eller för få träningsexempel.")
-    volume_columns = []
-    columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
-    feat = build_features(df, horizon_weeks, macro_df).dropna(subset=columns + ["target_return"])
-    eligible = feat.loc[feat["target_date"] < pd.Timestamp(holdout_start)]
-    records = []
-    next_origin = None
-    for _, row in eligible.iterrows():
-        origin = row["date"]
-        if next_origin is not None and origin < next_origin:
-            continue
-        known = feat.loc[feat["target_date"] < origin]
-        if len(known) < min_train_rows:
-            continue
-        params = {}
-        history_weeks = None
-        val_count = max(MIN_EVAL_ROWS, int(len(known) * 0.2))
-        validation = known.iloc[-val_count:]
-        inner_train = known.loc[known["target_date"] < validation["date"].iloc[0]]
-        tuned = len(inner_train) >= min_train_rows
-        if tuned:
-            params, history_weeks, _, _ = _select_configuration(
-                method, inner_train, validation, columns, min_train_rows
-            )
-        known = _training_window(known, history_weeks)
-        estimator = METHODS[method]().set_params(**params)
-        estimator.fit(known[columns], known["target_return"])
-        inputs = feat.loc[[row.name], columns]
-        predicted_return = float(estimator.predict(inputs)[0])
-        records.append({
-            "date": origin, "target_date": row["target_date"],
-            "train_target_end": known["target_date"].max(), "n_train": len(known),
-            "price": row["price"], "actual_price": row["target_price"],
-            "predicted_price": row["price"] * (1 + predicted_return),
-            "actual_return": row["target_return"], "predicted_return": predicted_return,
-            "tuned": tuned,
-            "history_weeks": history_weeks, "best_params": params.copy(),
-        })
-        next_origin = origin + pd.Timedelta(weeks=step_weeks)
-    result = {"predictions": pd.DataFrame(records), "n_test": len(records),
-              "step_weeks": step_weeks, "min_train_rows": min_train_rows}
-    if not records:
-        return result
-    rows = result["predictions"]
-    result.update({
-        "rmse": float(np.sqrt(mean_squared_error(rows.actual_price, rows.predicted_price))),
-        "naive_rmse": float(np.sqrt(mean_squared_error(rows.actual_price, rows.price))),
-        "return_rmse_pct": float(np.sqrt(mean_squared_error(rows.actual_return, rows.predicted_return)) * 100),
-        "historical_margin_pct": historical_price_margin(rows.actual_price, rows.predicted_price),
-    })
-    return result
-
-
 def load_model(method: str = "Random Forest", horizon_weeks: int = 1, macro_df: pd.DataFrame | None = None):
     path = _model_path(method, horizon_weeks, macro_df is not None)
     if not path.exists():
         return train_model(method=method, horizon_weeks=horizon_weeks, macro_df=macro_df)[0]
     return joblib.load(path)
+
+
+def replace_latest_price_for_inference(df: pd.DataFrame, latest_price: float) -> pd.DataFrame:
+    """Returnera en kopia där senaste veckopriset ersatts för en aktuell prognos.
+
+    Originaldata och datum ändras inte. `pct_change` uppdateras om kolumnen finns,
+    även om `build_features` räknar om den innan modellen används.
+    """
+    if df.empty or "date" not in df or "price" not in df:
+        raise ValueError("Prognosdatan måste innehålla minst ett datum och pris.")
+    price = float(latest_price)
+    if not np.isfinite(price) or price <= 0:
+        raise ValueError("Det senaste priset måste vara positivt och ändligt.")
+
+    inference_df = df.copy()
+    ordered_indices = pd.to_datetime(inference_df["date"]).sort_values().index
+    latest_index = ordered_indices[-1]
+    inference_df.at[latest_index, "price"] = price
+    if "pct_change" in inference_df and len(ordered_indices) > 1:
+        previous_price = float(inference_df.at[ordered_indices[-2], "price"])
+        inference_df.at[latest_index, "pct_change"] = (price / previous_price - 1) * 100
+    return inference_df
 
 
 def predict_price(
@@ -452,7 +456,7 @@ def predict_price(
     if latest[feature_columns].isna().any().any():
         raise ValueError("Prognosen kräver minst 53 veckopriser och kompletta, aktuella data för alla valda faktorer.")
     pred_return = model.predict(latest[feature_columns])[0]
-    return float(latest["price"].iloc[0] * (1 + pred_return))
+    return float(_prices_from_returns(latest["price"].iloc[0], pred_return))
 
 
 if __name__ == "__main__":

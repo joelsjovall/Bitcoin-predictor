@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 import model as model_module
-from model import FEATURE_COLUMNS, build_features, predict_price, train_model
+from model import FEATURE_COLUMNS, build_features, predict_price, replace_latest_price_for_inference, train_model
 
 
 def make_price_frame(periods: int = 220) -> pd.DataFrame:
@@ -43,7 +43,8 @@ def test_train_model_returns_metrics_and_saves_model(tmp_path, monkeypatch):
     assert metrics["n_val"] > 0
     assert metrics["n_test"] > 0
     assert "best_params" in metrics
-    for key in ["val_rmse", "mae", "rmse", "r2", "naive_mae", "naive_rmse", "historical_margin_pct"]:
+    for key in ["val_rmse", "mae", "rmse", "r2", "naive_mae", "naive_rmse",
+                "historical_margin_pct", "relative_price_rmse_pct", "interval_coverage_pct"]:
         assert key in metrics
         assert np.isfinite(metrics[key])
 
@@ -54,6 +55,20 @@ def test_historical_margin_covers_at_least_eighty_percent_relative_to_prediction
     margin = model_module.historical_price_margin(actual, predictions)
     assert margin == pytest.approx(30)
     assert np.mean(np.abs(actual - predictions) <= predictions * margin / 100) >= 0.8
+
+
+def test_interval_diagnostics_calibrates_before_checking_later_coverage():
+    predictions = np.full(10, 100.0)
+    actual = np.array([100, 101, 98, 103, 96, 105, 94, 120, 80, 130])
+    stats = model_module.price_interval_diagnostics(actual, predictions)
+
+    assert stats["n_margin_calibration"] == 7
+    assert stats["n_coverage_test"] == 3
+    assert stats["historical_margin_pct"] == pytest.approx(5)
+    assert stats["relative_price_rmse_pct"] == pytest.approx(
+        np.sqrt(np.mean(np.array([0, 1, -2, 3, -4, 5, -6], dtype=float) ** 2))
+    )
+    assert stats["interval_coverage_pct"] == 0
 
 
 @pytest.mark.parametrize("predictions", [[0, 100], [-10, 100], [np.nan, 100], [np.inf, 100]])
@@ -70,6 +85,31 @@ def test_predict_price_returns_positive_float(tmp_path, monkeypatch):
 
     assert isinstance(prediction, float)
     assert prediction > 0
+
+
+def test_latest_live_price_is_used_only_in_inference_copy():
+    original = make_price_frame(60)
+    original_latest_price = original.iloc[-1]["price"]
+    live_price = original_latest_price * 1.1
+
+    inference = replace_latest_price_for_inference(original, live_price)
+
+    assert original.iloc[-1]["price"] == original_latest_price
+    assert inference.iloc[-1]["price"] == pytest.approx(live_price)
+    assert inference.iloc[-1]["pct_change"] == pytest.approx(
+        (live_price / inference.iloc[-2]["price"] - 1) * 100
+    )
+    assert inference.iloc[-1]["date"] == original.iloc[-1]["date"]
+
+
+def test_predict_price_uses_zero_as_floor_for_negative_raw_price():
+    class BelowMinusOneReturnModel:
+        def predict(self, rows):
+            return np.full(len(rows), -1.5)
+
+    prediction = predict_price(make_price_frame(60), BelowMinusOneReturnModel())
+
+    assert prediction == 0
 
 
 def test_feature_columns_excludes_duplicate_return():

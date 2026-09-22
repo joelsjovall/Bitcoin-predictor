@@ -1,10 +1,18 @@
 """Frontend: Streamlit-app som visar Bitcoin-data och en prisprognos."""
+import math
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from db import ingest_csv, ingest_live, load_prices_df
-from model import FORECAST_HORIZONS, METHODS, predict_price, train_model, rolling_backtest
+from model import (
+    FORECAST_HORIZONS,
+    METHODS,
+    predict_price,
+    replace_latest_price_for_inference,
+    train_model,
+)
 from macro import MACRO_FEATURE_COLUMNS, build_macro_features, fetch_macro_prices
 
 st.set_page_config(page_title="Bitcoin – pris & prognos", layout="wide")
@@ -100,122 +108,186 @@ def get_macro_data(start: str) -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_macro_model_and_metrics(selected_method: str, selected_weeks: int, bitcoin_data: pd.DataFrame, macro_data: pd.DataFrame, training_version=2):
+def get_macro_model_and_metrics(selected_method: str, selected_weeks: int, bitcoin_data: pd.DataFrame, macro_data: pd.DataFrame, training_version=4):
     # Metrics include the historical 80% price margin.
     return train_model(bitcoin_data, method=selected_method, horizon_weeks=selected_weeks, macro_df=macro_data)
 
 
 @st.cache_resource
-def get_model_and_metrics(selected_method: str, selected_weeks: int, training_version=2):
+def get_model_and_metrics(selected_method: str, selected_weeks: int, training_version=4):
     # Metrics include the historical 80% price margin.
     return train_model(get_data(), method=selected_method, horizon_weeks=selected_weeks)
 
 
-@st.cache_resource
-def get_rolling_metrics(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data=None, training_version=2):
-    return rolling_backtest(bitcoin_data, selected_method, selected_weeks, holdout_start, macro_data)
+def is_positive_finite(value) -> bool:
+    try:
+        return math.isfinite(float(value)) and float(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
-def show_rolling_evaluation(bitcoin_data, selected_method, selected_weeks, model_metrics, prediction, macro_data=None):
-    st.subheader("Rullande tester över tidigare historik")
-    latest = bitcoin_data.sort_values("date").iloc[-1]
-    target_date = pd.Timestamp(latest["date"]) + pd.Timedelta(weeks=selected_weeks)
-    forecast_name = "Bitcoin + makro" if macro_data is not None else "Bitcoin"
-    st.metric(
-        f"Prisprognos – {forecast_name} (rullande utvärdering)",
-        f"{prediction:,.0f} USD",
-        f"{(prediction / latest['price'] - 1) * 100:+.1f}%",
-    )
-    st.caption(
-        f"Prognosen gäller {target_date:%Y-%m-%d}, {selected_weeks} veckor efter senaste prisdatum. "
-        "Det är samma aktuella prognos från slutmodellen som ovan. Här bedöms felmarginalen "
-        "med rullande historiska tester; testerna skapar inte ett separat framtida prognospris."
-    )
-    with st.spinner("Tränar och testar vid historiska prognosdatum…"):
-        rolling = get_rolling_metrics(bitcoin_data, selected_method, selected_weeks, model_metrics["test_start"], macro_data)
-    st.caption(
-        "Ny träning och prognos var 13:e vecka, med minst 104 kompletta träningsexempel. "
-        "Bara redan kända utfall används; inställningar väljs på då tillgänglig valideringsdata "
-        "när den räcker, annars används standardinställningar. Alla testutfall ligger före senaste sluttestet."
-    )
-    if rolling["n_test"] == 0:
+def is_nonnegative_finite(value) -> bool:
+    try:
+        return math.isfinite(float(value)) and float(value) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def format_optional_pct(value, prefix="") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "Ej tillgänglig"
+    return f"{prefix}{number:.1f} %" if math.isfinite(number) else "Ej tillgänglig"
+
+
+def show_best_method(metrics_by_method, selected_method, model_name):
+    comparable = {
+        name: float(values["relative_price_rmse_pct"])
+        for name, values in metrics_by_method.items()
+        if values.get("relative_price_rmse_pct") is not None
+        and math.isfinite(float(values["relative_price_rmse_pct"]))
+    }
+    if not comparable:
         st.info(
-            "Ingen rullande utvärdering är möjlig för den här horisonten just nu – inte bara "
-            "tunt underlag, utan noll giltiga testcykler. Varje cykel kräver minst 104 kompletta "
-            "historiska exempel vars utfall redan är kända före senaste sluttestet, och med vår "
-            "nuvarande dataserie räcker historiken inte till det förrän om ungefär 3 år till. "
-            "Senaste sluttestet visas ovan istället."
+            f"Bästa metoden för {model_name} kan inte utses eftersom relativ RMSE saknas "
+            "för samtliga metoder."
         )
         return
-    if rolling["n_test"] < 2:
-        st.info("För lite tidigare historik för en sammanfattning av rullande tester vid denna horisont. Senaste sluttestet visas ovan.")
-        return
-    rows = rolling["predictions"]
-    st.caption(
-        f"{len(rows)} prognoser från {rows.date.min():%Y-%m-%d} till {rows.date.max():%Y-%m-%d}. "
-        f"Utfall: {rows.target_date.min():%Y-%m-%d} – {rows.target_date.max():%Y-%m-%d}. "
-        "Överlappande prognoser är inte oberoende cykler; långa horisonter ger färre testmöjligheter."
-    )
-    if len(rows) < 20:
-        st.caption("Få historiska prognoser: felmarginalen är ett osäkert underlag.")
-    st.metric("RMSE (rullande, USD)", f"{rolling['rmse']:,.0f}",
-              help=f"Oförändrat pris: {rolling['naive_rmse']:,.0f} USD")
-    show_historical_margin(prediction, rolling, "rullande tester")
-    with st.expander("Historiska prognoser och faktiska utfall"):
-        chart = go.Figure()
-        chart.add_trace(go.Scatter(x=rows.target_date, y=rows.actual_price, name="Faktiskt pris"))
-        chart.add_trace(go.Scatter(x=rows.target_date, y=rows.predicted_price, name="Historisk prognos"))
-        chart.update_layout(xaxis_title="Datum för utfallet", yaxis_title="Pris (USD)")
-        st.plotly_chart(chart, width="stretch")
-        st.dataframe(rows[["date", "target_date", "predicted_price", "actual_price", "n_train", "tuned"]].rename(columns={
-            "date": "Prognosdatum", "target_date": "Utfallsdatum", "predicted_price": "Prognos (USD)",
-            "actual_price": "Utfall (USD)", "n_train": "Träningsexempel", "tuned": "Inställningar validerade",
-        }), hide_index=True, width="stretch")
+
+    best_method = min(comparable, key=comparable.get)
+    best_score = comparable[best_method]
+    selected_score = comparable.get(selected_method)
+    if selected_method == best_method:
+        st.success(
+            f"**{best_method}** är bästa metoden för {model_name} "
+            f"(lägst relativ RMSE: {best_score:.1f} %)"
+        )
+    elif selected_score is None:
+        st.info(
+            f"Bästa metoden för {model_name} är **{best_method}** "
+            f"(relativ RMSE: {best_score:.1f} %). Relativ RMSE kan inte beräknas för {selected_method}."
+        )
+    else:
+        st.info(
+            f"Bästa metoden för {model_name} är **{best_method}** "
+            f"(relativ RMSE {best_score:.1f} % mot {selected_score:.1f} % för {selected_method})"
+        )
 
 
 def show_historical_margin(prediction, model_metrics, source="senaste sluttestet"):
     margin = model_metrics["historical_margin_pct"]
-    if margin is None or not 0 < prediction < float("inf"):
-        st.info("Historisk felmarginal kan inte visas eftersom en prognos saknar ett giltigt positivt pris.")
+    if not is_positive_finite(prediction):
+        st.info("Historisk felmarginal kan inte appliceras eftersom den aktuella prisprognosen inte är positiv och ändlig.")
+        return
+    if margin is None:
+        st.info(
+            "Historisk felmarginal och relativ RMSE kan inte beräknas eftersom sluttestet "
+            "innehåller minst en icke-positiv eller ogiltig prisprognos. RMSE i USD visas fortfarande."
+        )
         return
     low = max(0, prediction * (1 - margin / 100))
     high = prediction * (1 + margin / 100)
-    error_col, interval_col = st.columns(2)
-    error_col.metric(f"Historisk felmarginal (80 %, {source})", f"±{margin:.1f} %")
+    coverage = model_metrics.get("interval_coverage_pct")
+    calibration_count = model_metrics.get("n_margin_calibration", model_metrics.get("n_test", 0))
+    coverage_count = model_metrics.get("n_coverage_test", 0)
+    columns = st.columns(3 if coverage is not None else 2)
+    error_col, interval_col = columns[:2]
+    error_col.metric(f"Kalibrerad felmarginal (80 %, {source})", f"±{margin:.1f} %")
     interval_col.metric("Prisintervall utifrån historiska fel", f"{low:,.0f}–{high:,.0f} USD")
-    st.caption(
-        f"Minst 8 av 10 prognoser i {source} låg inom denna procentuella avvikelse från utfallet, "
-        "räknat i procent av prognospriset. Felmarginalen gäller den valda modellen och tidshorisonten. "
-        "Historiska fel kan vara större; intervallet är ingen garanti för nästa utfall."
+    if coverage is not None:
+        columns[2].metric(
+            "Täckning i senare kontroll",
+            f"{coverage:.0f} %",
+            help=f"{coverage_count} senare prognoser som inte användes för att bestämma marginalen.",
+        )
+        coverage_explanation = (
+            f"Marginalen är 80:e percentilen av de absoluta relativa prisfelen i de {calibration_count} "
+            f"äldre kalibreringsprognoserna. I {coverage_count} senare kontrollprognoser hamnade "
+            f"{coverage:.0f} % av utfallen inom samma marginal. Kontrollvärdet är inte tvingat till 80 %."
+        )
+    else:
+        coverage_explanation = (
+            f"Marginalen är 80:e percentilen av de absoluta relativa prisfelen i {calibration_count} "
+            "historiska prognoser. Underlaget är för litet för en separat senare täckningskontroll."
+        )
+    with st.popover("ℹ️ Information om intervallet"):
+        st.write(coverage_explanation)
+        st.write(
+            "Prisintervallet är dagens prognos × (1 ± marginalen). Det är en historiskt kalibrerad "
+            "osäkerhetsindikator, inte en garanti eller en formell sannolikhetsprognos."
+        )
+        if margin > 100:
+            st.write("Intervallets nedre gräns visas som 0 USD eftersom felmarginalen överstiger 100 %.")
+
+
+def show_error_metrics(model_metrics, source):
+    usd_col, relative_col = st.columns(2)
+    usd_col.metric(
+        f"RMSE ({source}, USD)", f"{model_metrics['rmse']:,.0f}",
+        help=f"Naiv RMSE med oförändrat pris: {model_metrics['naive_rmse']:,.0f} USD",
     )
-    if margin > 100:
-        st.caption("Intervallets nedre gräns visas som 0 USD eftersom felmarginalen överstiger 100 %.")
+    relative_col.metric(
+        "Relativ RMSE (kalibrering)",
+        format_optional_pct(model_metrics.get("relative_price_rmse_pct")),
+        help="Använder samma kalibreringsprognoser och samma procentuella felbas som 80 %-marginalen.",
+    )
+    with st.popover("ℹ️ Information om felmåtten"):
+        if model_metrics.get("relative_price_rmse_pct") is None:
+            st.write(
+                "Relativ RMSE saknas eftersom minst en historisk testprognos inte var positiv och ändlig. "
+                "Ett procentfel med prognospriset i nämnaren är då inte meningsfullt. RMSE i USD kan fortfarande beräknas."
+            )
+        else:
+            st.markdown(
+                """
+                Både **relativ RMSE** och **80 %-felmarginalen** utgår från samma kalibreringsprognoser
+                och samma relativa prisfel:
+
+                `(utfall − prognos) / prognos × 100`
+
+                - **Relativ RMSE** beskriver modellens samlade procentuella felstorlek. Felen kvadreras,
+                  så enstaka stora missar får extra stor påverkan. Måttet används för att bedöma
+                  träffsäkerhet; lägre är bättre.
+                - **80 %-felmarginalen** är den 80:e percentilen av felens absolutbelopp. Den beskriver
+                  hur bred marginal som behövdes för att omfatta minst 80 % av kalibreringsfelen och
+                  används därför för prisintervallet runt dagens prognos.
+                - **Täckningen i senare kontroll** visar hur stor andel av senare, oanvända utfall som
+                  faktiskt hamnade inom den kalibrerade felmarginalen.
+
+                Måtten behöver inte vara lika och det finns ingen fast omräkning mellan dem. Relativ
+                RMSE är ett genomsnittsliknande felmått, medan felmarginalen är en historisk gräns.
+                Prisintervallet är ingen garanti eller formell sannolikhetsprognos.
+                """
+            )
+            st.write(
+                "RMSE i USD använder hela sluttestet och visar prisfelets storlek i dollar. Det påverkas "
+                "därför av Bitcoins prisnivå och är främst användbart för jämförelser på samma testperiod."
+            )
 
 
 def show_evaluation(model_metrics):
-    st.metric(
-        "RMSE (test, USD)", f"{model_metrics['rmse']:,.0f}",
-        help=f"Naiv RMSE (oförändrat pris): {model_metrics['naive_rmse']:,.0f} USD",
-    )
-    st.caption(
-        f"Bitcoin-historik: {model_metrics['data_start']:%Y-%m-%d} – {model_metrics['data_end']:%Y-%m-%d}. "
-        f"Slutmodellen tränas om på {model_metrics['n_production']} kompletta exempel i vald historik: "
-        f"{model_metrics['production_train_start']:%Y-%m-%d} – {model_metrics['production_train_end']:%Y-%m-%d}, "
-        f"med kända utfall till {model_metrics['production_target_end']:%Y-%m-%d}."
-    )
-    st.caption(
-        f"RMSE-testets prognosdatum: {model_metrics['test_start']:%Y-%m-%d} – {model_metrics['test_end']:%Y-%m-%d}. "
-        f"Utfallen som jämförs ligger {model_metrics['test_target_start']:%Y-%m-%d} – "
-        f"{model_metrics['test_target_end']:%Y-%m-%d} ({model_metrics['n_test']} exempel). "
-        "Testperioden är inte slutmodellens hela träningsperiod."
-    )
+    show_error_metrics(model_metrics, "hela sluttestet")
     history = model_metrics.get("history_weeks")
     label = "hela historiken" if history is None else f"upp till {history // 52} år"
-    st.caption(f"Modellen använder {label}. Historikfönstret slutar vid senaste träningsexemplet med känt utfall.")
-    if model_metrics["tuned"]:
-        st.caption("Historiklängd och modellens parametrar väljs gemensamt på valideringsdata. Sluttestet används inte för valet.")
-    else:
-        st.caption("För lite historik för validering: hela historiken och standardinställningar används utan optimering.")
+    with st.popover("ℹ️ Information om testunderlaget"):
+        st.write(
+            f"Bitcoin-historik: {model_metrics['data_start']:%Y-%m-%d} – {model_metrics['data_end']:%Y-%m-%d}. "
+            f"Slutmodellen tränas om på {model_metrics['n_production']} kompletta exempel i vald historik: "
+            f"{model_metrics['production_train_start']:%Y-%m-%d} – {model_metrics['production_train_end']:%Y-%m-%d}, "
+            f"med kända utfall till {model_metrics['production_target_end']:%Y-%m-%d}."
+        )
+        st.write(
+            f"RMSE-testets prognosdatum: {model_metrics['test_start']:%Y-%m-%d} – {model_metrics['test_end']:%Y-%m-%d}. "
+            f"Utfallen som jämförs ligger {model_metrics['test_target_start']:%Y-%m-%d} – "
+            f"{model_metrics['test_target_end']:%Y-%m-%d} ({model_metrics['n_test']} exempel). "
+            "Testperioden är inte slutmodellens hela träningsperiod."
+        )
+        st.write(f"Modellen använder {label}. Historikfönstret slutar vid senaste träningsexemplet med känt utfall.")
+        if model_metrics["tuned"]:
+            st.write("Historiklängd och modellens parametrar väljs gemensamt på valideringsdata. Sluttestet används inte för valet.")
+        else:
+            st.write("För lite historik för validering: hela historiken och standardinställningar används utan optimering.")
 
 
 df, auto_update_error = ensure_fresh_data()
@@ -227,28 +299,30 @@ if pd.Timestamp.now().normalize() - latest_date > pd.Timedelta(days=7):
     )
 if auto_update_error:
     st.caption(f"ℹ️ {auto_update_error}")
-model, metrics = get_model_and_metrics(method, weeks_ahead)
-next_price = predict_price(df, model, horizon_weeks=weeks_ahead)
-last_row = df.iloc[-1]
-change_pct = (next_price - last_row["price"]) / last_row["price"] * 100
-forecast_date = last_row["date"] + pd.Timedelta(weeks=weeks_ahead)
-
-all_metrics = {m: get_model_and_metrics(m, weeks_ahead)[1] for m in METHODS}
-best_method = min(all_metrics, key=lambda m: all_metrics[m]["rmse"])
-best_rmse = all_metrics[best_method]["rmse"]
-
-if method == best_method:
-    st.success(f"🏆 **{method}** är just nu bästa metoden (lägst RMSE: {best_rmse:,.0f})")
-else:
-    st.info(
-        f"🏆 Bästa metoden just nu är **{best_method}** "
-        f"(RMSE {best_rmse:,.0f} mot {metrics['rmse']:,.0f} för {method})"
-    )
-
 try:
     current_price = get_current_price()
 except Exception:
     current_price = None
+
+last_row = df.iloc[-1]
+if is_positive_finite(current_price):
+    inference_df = replace_latest_price_for_inference(df, current_price)
+    forecast_base_price = float(current_price)
+    forecast_origin_date = pd.Timestamp.now().normalize()
+else:
+    inference_df = df
+    forecast_base_price = float(last_row["price"])
+    forecast_origin_date = pd.Timestamp(last_row["date"])
+
+model, metrics = get_model_and_metrics(method, weeks_ahead)
+next_price = predict_price(inference_df, model, horizon_weeks=weeks_ahead)
+prediction_is_valid = is_nonnegative_finite(next_price)
+change_pct = ((next_price - forecast_base_price) / forecast_base_price * 100
+              if prediction_is_valid else None)
+forecast_date = forecast_origin_date + pd.Timedelta(weeks=weeks_ahead)
+
+all_metrics = {m: get_model_and_metrics(m, weeks_ahead)[1] for m in METHODS}
+show_best_method(all_metrics, method, "Bitcoin")
 
 col1, col_now, col2 = st.columns(3)
 col1.metric(
@@ -256,39 +330,59 @@ col1.metric(
     f"{last_row['price']:,.0f}",
     help=f"Veckosnapshotet från {last_row['date'].date()} som modellen tränas och testas på.",
 )
-if current_price is not None:
+if is_positive_finite(current_price):
     col_now.metric(
         "Pris just nu (idag)",
         f"{current_price:,.0f}",
-        help="Dagens faktiska Bitcoin-pris, hämtat live. Rent visuellt – påverkar inte modellens "
-             "träning, prognoser eller RMSE-beräkningar.",
+        help="Dagens Bitcoin-pris ersätter tillfälligt senaste veckopriset när prognosens features "
+             "beräknas. Databasen, modellträningen och RMSE-testet ändras inte.",
     )
 else:
     col_now.caption("Kunde inte hämta dagens pris just nu.")
-col2.metric(f"Prognos om {horizon_label}", f"{next_price:,.0f}", f"{change_pct:+.1f}%")
+if prediction_is_valid:
+    col2.metric(f"Prognos om {horizon_label}", f"{next_price:,.0f}", f"{change_pct:+.1f}%")
+    if next_price == 0:
+        st.warning(
+            f"{method} gav en rå prisprognos på 0 USD eller lägre för {horizon_label}. "
+            "Prognosen visas därför med det ekonomiska golvet 0 USD. Ett procentbaserat "
+            "prisintervall kan inte beräknas runt 0."
+        )
+else:
+    col2.metric(f"Prognos om {horizon_label}", "Ej giltig")
+    st.warning(
+        f"{method} gav en icke ändlig prisprognos för {horizon_label}. "
+        "Prognosen visas därför inte. Välj en annan metod eller horisont."
+    )
 show_historical_margin(next_price, metrics)
 show_evaluation(metrics)
-show_rolling_evaluation(df, method, weeks_ahead, metrics, next_price)
-st.info(
-    f"Prognoserna utgår från senaste Bitcoin-observationen {last_row['date']:%Y-%m-%d} "
-    f"och gäller {forecast_date:%Y-%m-%d}. Träning kräver ett känt utfall {weeks_ahead} veckor senare; "
-    "de senaste veckorna används som prognosindata men kan inte vara träningsmål innan utfallet finns. "
-    "De första 52 veckorna används för att bygga historiska features."
-)
+with st.popover("ℹ️ Information om prognosen"):
+    if is_positive_finite(current_price):
+        st.write(
+            f"Prognosen gäller {forecast_date:%Y-%m-%d}. För just denna prognos ersätts priset i den "
+            f"senaste veckoraden ({last_row['date']:%Y-%m-%d}) tillfälligt med dagens pris "
+            f"{current_price:,.0f} USD, så prisbaserade features räknas om. Databasen och modellens "
+            "träning/test behåller det riktiga veckopriset."
+        )
+    else:
+        st.write(
+            f"Dagens pris kunde inte användas, så prognosen utgår från senaste Bitcoin-observationen "
+            f"{last_row['date']:%Y-%m-%d} och gäller {forecast_date:%Y-%m-%d}."
+        )
 
 st.subheader(f"Prishistorik – {method} ({horizon_label} framåt)")
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=df["date"], y=df["price"], name="Pris", mode="lines"))
-fig.add_trace(
-    go.Scatter(
-        x=[last_row["date"], forecast_date],
-        y=[last_row["price"], next_price],
-        name="Prognos",
-        mode="lines+markers",
-        line=dict(dash="dot", color="orange"),
+if prediction_is_valid:
+    fig.add_trace(
+        go.Scatter(
+            x=[forecast_origin_date, forecast_date],
+            y=[forecast_base_price, next_price],
+            name="Prognos",
+            mode="lines+markers",
+            line=dict(dash="dot", color="orange"),
+        )
     )
-)
 fig.update_layout(
     xaxis_title="Datum",
     yaxis_title="Pris (USD)",
@@ -317,6 +411,8 @@ st.dataframe(
 )
 
 with st.expander("Om modellen"):
+    relative_rmse_text = format_optional_pct(metrics.get("relative_price_rmse_pct"))
+    margin_text = format_optional_pct(metrics.get("historical_margin_pct"), prefix="±")
     if metrics["tuned"]:
         methodology = f"""
         **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
@@ -351,6 +447,8 @@ with st.expander("Om modellen"):
         - MAE: {metrics['mae']:.1f} (naiv baseline, dvs. "priset om {weeks_ahead} veckor
           = samma som nu": {metrics['naive_mae']:.1f})
         - RMSE: {metrics['rmse']:.1f} (naiv baseline: {metrics['naive_rmse']:.1f})
+        - Relativ RMSE på intervallets kalibreringsdel: {relative_rmse_text}
+        - Kalibrerad 80 %-marginal: {margin_text}
         - R²: {metrics['r2']:.3f}
 
         Detta är en proof of concept – flödet (data → databas → AI-modell → frontend)
@@ -365,10 +463,15 @@ with st.expander("Om modellen"):
         """
     )
 
-    st.write("**Jämförelse mellan metoder (test-RMSE, lägre är bättre):**")
+    st.write("**Jämförelse mellan metoder (relativ RMSE, lägre är bättre):**")
     comparison = pd.DataFrame(
-        [{"Metod": m, "RMSE": all_metrics[m]["rmse"], "MAE": all_metrics[m]["mae"]} for m in METHODS]
-    ).sort_values("RMSE")
+        [{
+            "Metod": m,
+            "Relativ RMSE (%)": all_metrics[m].get("relative_price_rmse_pct"),
+            "RMSE (USD)": all_metrics[m]["rmse"],
+            "MAE (USD)": all_metrics[m]["mae"],
+        } for m in METHODS]
+    ).sort_values("Relativ RMSE (%)", na_position="last")
     st.dataframe(comparison.set_index("Metod"), width="stretch")
 
 st.subheader(f"Bitcoin + makro – {method} ({horizon_label} framåt)")
@@ -380,29 +483,50 @@ if st.button("Uppdatera makrodata"):
 try:
     with st.spinner("Hämtar makrodata och tränar Bitcoin + makro…"):
         macro_data = get_macro_data((df["date"].min() - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
-        macro_model, macro_metrics = get_macro_model_and_metrics(method, weeks_ahead, df, macro_data)
-        macro_price = predict_price(df, macro_model, horizon_weeks=weeks_ahead, macro_df=macro_data)
-    macro_change_pct = (macro_price / last_row["price"] - 1) * 100
-    st.metric(f"Makroprognos om {horizon_label}", f"{macro_price:,.0f} USD", f"{macro_change_pct:+.1f}%")
+        all_macro_results = {
+            name: get_macro_model_and_metrics(name, weeks_ahead, df, macro_data)
+            for name in METHODS
+        }
+        macro_model, macro_metrics = all_macro_results[method]
+        macro_price = predict_price(inference_df, macro_model, horizon_weeks=weeks_ahead, macro_df=macro_data)
+    all_macro_metrics = {name: result[1] for name, result in all_macro_results.items()}
+    show_best_method(all_macro_metrics, method, "Bitcoin + makro")
+    macro_prediction_is_valid = is_nonnegative_finite(macro_price)
+    if macro_prediction_is_valid:
+        macro_change_pct = (macro_price / forecast_base_price - 1) * 100
+        st.metric(f"Makroprognos om {horizon_label}", f"{macro_price:,.0f} USD", f"{macro_change_pct:+.1f}%")
+        if macro_price == 0:
+            st.warning(
+                f"Bitcoin + makro med {method} gav en rå prisprognos på 0 USD eller lägre för "
+                f"{horizon_label}. Prognosen visas därför med golvet 0 USD; något procentbaserat "
+                "prisintervall kan inte beräknas runt 0."
+            )
+    else:
+        st.metric(f"Makroprognos om {horizon_label}", "Ej giltig")
+        st.warning(
+            f"Bitcoin + makro med {method} gav en icke ändlig prisprognos för {horizon_label}. "
+            "Prognosen visas därför inte."
+        )
     show_historical_margin(macro_price, macro_metrics)
     show_evaluation(macro_metrics)
-    show_rolling_evaluation(df, method, weeks_ahead, macro_metrics, macro_price, macro_data)
     macro_fig = go.Figure()
     macro_fig.add_trace(go.Scatter(x=df["date"], y=df["price"], name="Bitcoin-pris", mode="lines"))
-    macro_fig.add_trace(go.Scatter(
-        x=[last_row["date"], forecast_date], y=[last_row["price"], macro_price],
-        name="Prognos: Bitcoin + makro", mode="lines+markers", line=dict(dash="dot", color="orange"),
-    ))
+    if macro_prediction_is_valid:
+        macro_fig.add_trace(go.Scatter(
+            x=[forecast_origin_date, forecast_date], y=[forecast_base_price, macro_price],
+            name="Prognos: Bitcoin + makro", mode="lines+markers", line=dict(dash="dot", color="orange"),
+        ))
     macro_fig.update_layout(fig.layout)
     st.plotly_chart(macro_fig, width="stretch")
-    st.caption(
-        f"MAE: {macro_metrics['mae']:,.0f} USD. "
-        f"Hyperparametertuning: {'ja' if macro_metrics['tuned'] else 'nej, för kort historik'}."
-    )
+    with st.popover("ℹ️ Information om makromodellen"):
+        st.write(
+            f"MAE: {macro_metrics['mae']:,.0f} USD. "
+            f"Hyperparametertuning: {'ja' if macro_metrics['tuned'] else 'nej, för kort historik'}."
+        )
+        if macro_metrics["test_dates"] == metrics["test_dates"]:
+            st.write("Bitcoin- och makromodellen utvärderas på samma testdatum.")
     if macro_metrics["test_dates"] != metrics["test_dates"]:
         st.warning("Modellerna har olika testdatum på grund av datatäckningen. Deras RMSE är inte direkt jämförbara.")
-    else:
-        st.caption("Båda modellerna utvärderas på samma testdatum.")
     with st.expander("Makrofaktorer och enheter"):
         st.write(
             "S&P 500 och guld: 12- och 52-veckors prisavkastning (decimalform i modellen, % nedan). "
