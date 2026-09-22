@@ -3,7 +3,7 @@
 Volym hämtas och sparas i databasen för framtida experiment, men används för
 närvarande inte som modellfeature. Ett kontrollerat test på samma data gav högre
 Ridge-fel med volym (12 367 USD) än utan volym (10 532 USD). Volym ska aktiveras
-igen först efter jämförelse på samma testdatum och i rullande tester.
+igen först efter jämförelse på samma sluttestdatum.
 
 ## Modellval
 
@@ -16,14 +16,18 @@ beräknas före avgränsningen. Fönstret räknas bakåt från senaste tillgäng
 träningsexemplets prognosdatum, inte från dagens datum; dess utfall måste vara känt.
 Vald längd används även vid sluttest och omträning för den aktuella prognosen.
 Vid lika resultat behålls första alternativet, hela historiken.
-Rullande tester väljer på nytt vid varje tidpunkt med endast då kända utfall.
 Appen visar vald historiklängd för alla modeller.
-Ridge fungerar med både Bitcoin-faktorer och makrodata samt i rullande tester.
+Ridge fungerar med både Bitcoin-faktorer och makrodata.
 Om historiken inte räcker för validering används hela historiken och `alpha=1`.
 Modellfilerna använder versionsprefixet `history_v2` för att inte läsa äldre
 modeller som tränats med annan historiklängd.
 Jämför testresultaten med oförändrat pris; Ridge garanterar inte lägre fel.
 Starta om Streamlit efter att det nya modellvalet lagts till.
+
+Appens markering av **bästa metod** baseras på lägst relativ RMSE i
+kalibreringsdelen, separat för Bitcoin och Bitcoin + makro. Metoder där relativ
+RMSE inte kan beräknas på grund av en historisk nollprognos deltar inte i den
+jämförelsen. RMSE i USD och MAE visas fortfarande som kompletterande mått.
 
 ## Två prognosmodeller
 
@@ -101,7 +105,17 @@ omvandlingar av historiska priser, inte nya externa datakällor.
 Målet är framtida avkastning: `price.shift(-horizon_weeks) / price - 1`.
 1, 2 och 3 år motsvarar 52, 104 och 156 veckor. Varje horisont tränas separat;
 framtida avkastning används aldrig som indata. Prognospriset beräknas som
-`senaste_pris * (1 + prognostiserad_avkastning)`.
+`senaste_pris * (1 + prognostiserad_avkastning)`, med 0 USD som lägsta möjliga
+pris. Samma golv används vid validering, sluttest och aktuell prognos. Om råvärdet
+är negativt visas därför 0 USD och -100 procent; ett procentbaserat prisintervall
+kan då inte beräknas eftersom prognospriset ligger i nämnaren.
+
+För den aktuella prognosen skapar appen en tillfällig kopia av veckodatan och
+ersätter priset i den senaste veckoraden med det senast hämtade dagspriset.
+Prisbaserade features räknas därmed om med det aktuella priset för både Bitcoin
+och Bitcoin + makro. Kopian används bara vid inferens: databasen, träningen och
+sluttestets mått behåller de ursprungliga veckopriserna. Om dagspriset inte kan
+hämtas används senaste lagrade veckopris som tidigare.
 
 Datan måste ha en observation var sjunde dag. Måtten förutsätter att radens pris
 är känt vid radens datum; kontrollera detta särskilt för veckostaplar märkta med
@@ -116,25 +130,21 @@ med andra indatakolumner inte laddas. Test-RMSE och MAE jämförs med oförändr
 pris som referens; fler faktorer garanterar inte bättre prognoser. Jämför även
 med modellen utan de nya faktorerna på samma testdatum för att mäta förbättring.
 
-### Rullande historiska tester
+### Sluttest och felintervall
 
-Appen kör även `rolling_backtest` för vald modell och horisont, separat för
-Bitcoin och Bitcoin + makro. Var 13:e vecka tränas en ny modell på alla kompletta
-exempel vars utfallsdatum ligger strikt före prognosdatumet. Minst 104 sådana
-exempel krävs. De första 52 veckorna behövs dessutom för indikatorerna.
-
-Hyperparametrar väljs på de senaste 20 procenten av då kända träningsexempel
-om minst 104 exempel återstår för inre träning efter att överlappande mål tagits
-bort. Annars används metodens standardinställningar. Inställningar från den
-senare slutmodellen återanvänds aldrig i dessa historiska tester.
-
-Alla rullande testutfall måste ligga före senaste sluttestets första prognosdatum.
-Sluttestets mått och produktionsmodellens träning är oförändrade. Långa horisonter
-kan därför sakna tillräckligt med tidigare testhistorik; detta anges i appen.
-Resultaten cachelagras, men första körningen för en modell och horisont tar längre tid.
-
-Appen visar RMSE i USD, historiska prognoser mot faktiska utfall samt
-en separat historisk 80-procentsfelmarginal för respektive utvärdering. Felmarginalen
-är 80:e percentilen (avrundad uppåt till ett observerat fel) av
-`abs(utfall - prognos) / prognos`. Den beskriver de uppmätta felen, inte en kalibrerad
-sannolikhet för nästa prognos. Överlappande prognoser är inte oberoende cykler.
+Appen visar RMSE i USD och en 80-procentsfelmarginal från modellens kronologiska
+sluttest. När det finns minst tio
+prognoser används de äldsta 70 procenten för att kalibrera marginalen och de
+senare 30 procenten för en separat täckningskontroll. Felmarginalen är 80:e
+percentilen (avrundad uppåt till ett observerat fel) av
+`abs(utfall - prognos) / prognos`. Relativ RMSE beräknas på samma
+kalibreringsprognoser och med samma procentbas, men kvadrerar felen och påverkas
+därför mer av stora missar. Det beskriver modellens samlade procentuella
+felstorlek, medan 80-procentsfelmarginalen beskriver den historiska gräns som
+behövdes för att omfatta minst 80 procent av kalibreringsfelen. Måtten behöver
+inte vara lika och det finns ingen fast omräkning mellan dem. Prisintervallet
+använder felmarginalen; den senare kontrolltäckningen visar hur intervallet
+fungerade på utfall som inte användes för kalibreringen. Vid färre än tio
+prognoser används hela underlaget
+för marginalen och ingen separat täckning visas. Intervallet är en historiskt
+kalibrerad osäkerhetsindikator, inte en formell sannolikhet för nästa prognos.
