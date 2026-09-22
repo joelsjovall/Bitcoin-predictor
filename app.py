@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import ingest_csv, ingest_live, load_prices_df
+from macro import MACRO_FEATURE_COLUMNS, build_macro_features, fetch_macro_prices
 from model import (
     FORECAST_HORIZONS,
     METHODS,
@@ -13,9 +14,14 @@ from model import (
     replace_latest_price_for_inference,
     train_model,
 )
-from macro import MACRO_FEATURE_COLUMNS, build_macro_features, fetch_macro_prices
 
-AUTO_UPDATE_TTL_SECONDS = 3 * 60 * 60  # 3 timmar – färskt nog utan att hämta om vid varje interaktion
+AUTO_UPDATE_TTL_SECONDS = 3 * 60 * 60  # 3 timmar
+
+
+def clear_data_and_models() -> None:
+    """Töm data och modeller tillsammans efter en databasuppdatering."""
+    st.cache_data.clear()
+    st.cache_resource.clear()
 
 
 @st.cache_data(ttl=AUTO_UPDATE_TTL_SECONDS)
@@ -34,8 +40,7 @@ def ensure_fresh_data() -> tuple[pd.DataFrame, str | None]:
         ingest_live()
     except Exception:
         return data, "Automatisk live-uppdatering misslyckades just nu – visar senast sparade data."
-    st.cache_data.clear()
-    st.cache_resource.clear()
+    clear_data_and_models()
     return get_data(), None
 
 
@@ -57,6 +62,7 @@ def get_macro_data(start: str) -> pd.DataFrame:
     return fetch_macro_prices(start)
 
 
+# Versionsargumentet gör det möjligt att tömma modellcachen när träningskoden ändras.
 @st.cache_resource
 def get_macro_model_and_metrics(
     selected_method: str,
@@ -75,14 +81,16 @@ def get_model_and_metrics(selected_method: str, selected_weeks: int, training_ve
 
 def is_positive_finite(value) -> bool:
     try:
-        return math.isfinite(float(value)) and float(value) > 0
+        number = float(value)
+        return math.isfinite(number) and number > 0
     except (TypeError, ValueError):
         return False
 
 
 def is_nonnegative_finite(value) -> bool:
     try:
-        return math.isfinite(float(value)) and float(value) >= 0
+        number = float(value)
+        return math.isfinite(number) and number >= 0
     except (TypeError, ValueError):
         return False
 
@@ -245,9 +253,15 @@ def show_evaluation(model_metrics):
 
 
 def forecast_chart(
-    df, prediction, forecast_origin_date, forecast_date, forecast_base_price,
-    price_label="Pris", forecast_label="Prognos",
-):
+    df: pd.DataFrame,
+    prediction: float,
+    forecast_origin_date: pd.Timestamp,
+    forecast_date: pd.Timestamp,
+    forecast_base_price: float,
+    price_label: str = "Pris",
+    forecast_label: str = "Prognos",
+) -> go.Figure:
+    """Visa historik och en giltig prognos med samma layout för båda modellerna."""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df["date"], y=df["price"], name=price_label, mode="lines"))
     if is_nonnegative_finite(prediction):
@@ -282,27 +296,176 @@ def forecast_chart(
     return fig
 
 
-def main():
-    st.set_page_config(page_title="Bitcoin – pris & prognos", layout="wide")
-    st.title("Bitcoin – historik och prognos")
-
+def show_data_controls() -> None:
     with st.sidebar:
         st.header("Data & modell")
         if st.button("Läs in CSV på nytt i databasen"):
             n = ingest_csv()
             st.success(f"Laddade in {n} rader.")
-            st.cache_data.clear()
-            st.cache_resource.clear()
+            clear_data_and_models()
         if st.button("Hämta senaste data (live)"):
             try:
                 n = ingest_live()
                 st.success(f"Hämtade/uppdaterade {n} rader från Yahoo Finance.")
-                st.cache_data.clear()
-                st.cache_resource.clear()
+                clear_data_and_models()
             except Exception as e:
                 st.error(f"Kunde inte hämta live-data: {e}")
         if st.button("Träna om modellen"):
             st.cache_resource.clear()
+
+
+def show_model_details(method, horizon_label, weeks_ahead, metrics, all_metrics):
+    with st.expander("Om modellen"):
+        relative_rmse_text = format_optional_pct(metrics.get("relative_price_rmse_pct"))
+        margin_text = format_optional_pct(metrics.get("historical_margin_pct"), prefix="±")
+        if metrics["tuned"]:
+            methodology = f"""
+            **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
+            om {weeks_ahead} veckor?") med en kronologisk **tränings-/validerings-/test**-
+            uppdelning: {metrics['n_train']} tränings-, {metrics['n_val']} validerings- och
+            {metrics['n_test']} testexempel (äldst → nyast).
+
+            1. Ett par hyperparameter-kandidater tränas på träningsdelen och jämförs på
+               valideringsdelen – bästa valet: `{metrics['best_params'] or "standardvärden"}`
+               (val-RMSE: {metrics['val_rmse']:.1f}).
+            2. Den valda konfigurationen tränas om på träning+validering inom vald historiklängd och testas en
+               **enda gång** på den helt osedda testdelen – det är detta som rapporteras
+               nedan som modellens riktiga prestanda.
+            3. Den modell som faktiskt gör prognosen ovan tränas därefter om en sista gång
+               på kompletta exempel inom **vald historiklängd**. Testutfallen ingår först
+               efter utvärderingen.
+            """
+        else:
+            methodology = f"""
+            **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
+            om {weeks_ahead} veckor?"). Vår ~16-åriga historik räcker inte till tre helt
+            separata, läckagefria fönster vid så här lång horisont (varje fönster behöver
+            egen marginal på minst {weeks_ahead} veckor) – appen föll därför tillbaka på en
+            enklare uppdelning: {metrics['n_train']} tränings- och {metrics['n_test']}
+            testexempel (äldst → nyast), med metodens standardhyperparametrar (ingen
+            validerings-tuning för den här horisonten).
+            """
+        st.write(
+            methodology
+            + f"""
+            **Testresultat (helt osedd data):**
+            - MAE: {metrics['mae']:.1f} (naiv baseline, dvs. "priset om {weeks_ahead} veckor
+              = samma som nu": {metrics['naive_mae']:.1f})
+            - RMSE: {metrics['rmse']:.1f} (naiv baseline: {metrics['naive_rmse']:.1f})
+            - Relativ RMSE på intervallets kalibreringsdel: {relative_rmse_text}
+            - Kalibrerad 80 %-marginal: {margin_text}
+            - R²: {metrics['r2']:.3f}
+
+            Detta är en proof of concept – flödet (data → databas → AI-modell → frontend)
+            är det viktiga, inte modellens exakta träffsäkerhet.
+
+            Varje horisont (1 månad, 3 månader, ..., 5 år) har en egen modell som tränas
+            direkt mot faktiska historiska N-veckors-förändringar, istället för att kedja
+            ihop upprepade enveckasprognoser. Det ger en mer statistiskt rimlig prognos,
+            men ju längre horisont desto färre historiska exempel finns att träna på och
+            desto osäkrare är prognosen – en 5-årsprognos ska ses som en illustration av
+            flödet, inte som en tillförlitlig prisprognos.
+            """
+        )
+
+        st.write("**Jämförelse mellan metoder (relativ RMSE, lägre är bättre):**")
+        comparison = pd.DataFrame(
+            [{
+                "Metod": m,
+                "Relativ RMSE (%)": all_metrics[m].get("relative_price_rmse_pct"),
+                "RMSE (USD)": all_metrics[m]["rmse"],
+                "MAE (USD)": all_metrics[m]["mae"],
+            } for m in METHODS]
+        ).sort_values("Relativ RMSE (%)", na_position="last")
+        st.dataframe(comparison.set_index("Metod"), width="stretch")
+
+
+def show_macro_forecast(
+    df, inference_df, method, horizon_label, metrics,
+    forecast_origin_date, forecast_base_price,
+):
+    weeks_ahead = FORECAST_HORIZONS[horizon_label]
+    forecast_date = forecast_origin_date + pd.Timedelta(weeks=weeks_ahead)
+    st.subheader(f"Bitcoin + makro – {method} ({horizon_label} framåt)")
+    st.caption("Separat Bitcoin-prognos: samtliga Bitcoin-features + S&P 500, guld och amerikansk tioårsränta.")
+    if st.button("Uppdatera makrodata"):
+        get_macro_data.clear()
+        get_macro_model_and_metrics.clear()
+
+    try:
+        with st.spinner("Hämtar makrodata och tränar Bitcoin + makro…"):
+            macro_data = get_macro_data((df["date"].min() - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
+            all_macro_results = {
+                name: get_macro_model_and_metrics(name, weeks_ahead, df, macro_data)
+                for name in METHODS
+            }
+            macro_model, macro_metrics = all_macro_results[method]
+            macro_price = predict_price(inference_df, macro_model, horizon_weeks=weeks_ahead, macro_df=macro_data)
+        all_macro_metrics = {name: result[1] for name, result in all_macro_results.items()}
+        show_best_method(all_macro_metrics, method, "Bitcoin + makro")
+        macro_prediction_is_valid = is_nonnegative_finite(macro_price)
+        if macro_prediction_is_valid:
+            macro_change_pct = (macro_price / forecast_base_price - 1) * 100
+            st.metric(f"Makroprognos om {horizon_label}", f"{macro_price:,.0f} USD", f"{macro_change_pct:+.1f}%")
+            if macro_price == 0:
+                st.warning(
+                    f"Bitcoin + makro med {method} gav en rå prisprognos på 0 USD eller lägre för "
+                    f"{horizon_label}. Prognosen visas därför med golvet 0 USD; något procentbaserat "
+                    "prisintervall kan inte beräknas runt 0."
+                )
+        else:
+            st.metric(f"Makroprognos om {horizon_label}", "Ej giltig")
+            st.warning(
+                f"Bitcoin + makro med {method} gav en icke ändlig prisprognos för {horizon_label}. "
+                "Prognosen visas därför inte."
+            )
+        show_historical_margin(macro_price, macro_metrics)
+        show_evaluation(macro_metrics)
+        macro_fig = forecast_chart(
+            df, macro_price, forecast_origin_date, forecast_date, forecast_base_price,
+            price_label="Bitcoin-pris", forecast_label="Prognos: Bitcoin + makro",
+        )
+        st.plotly_chart(macro_fig, width="stretch")
+        with st.popover("ℹ️ Information om makromodellen"):
+            st.write(
+                f"MAE: {macro_metrics['mae']:,.0f} USD. "
+                f"Hyperparametertuning: {'ja' if macro_metrics['tuned'] else 'nej, för kort historik'}."
+            )
+            if macro_metrics["test_dates"] == metrics["test_dates"]:
+                st.write("Bitcoin- och makromodellen utvärderas på samma testdatum.")
+        if macro_metrics["test_dates"] != metrics["test_dates"]:
+            st.warning("Modellerna har olika testdatum på grund av datatäckningen. Deras RMSE är inte direkt jämförbara.")
+        with st.expander("Makrofaktorer och enheter"):
+            st.write(
+                "S&P 500 och guld: 12- och 52-veckors prisavkastning (decimalform i modellen, % nedan). "
+                "Tioårsränta: nivå i % och 12-veckors förändring i procentenheter, inte obligationsavkastning. "
+                "Grafen visar prognostiserat Bitcoin-pris i USD; prognosens avkastning visas ovan. "
+                "Inga framtida makrovärden matas in. Saknad eller mer än sju dagar gammal data fylls inte bakåt."
+            )
+            st.markdown(
+                "Källor: Yahoo Finance [S&P 500 (^GSPC)](https://finance.yahoo.com/quote/%5EGSPC/), "
+                "[guldterminer (GC=F)](https://finance.yahoo.com/quote/GC%3DF/) som guldproxy, "
+                "[tioårsränta (^TNX)](https://finance.yahoo.com/quote/%5ETNX/). "
+                "Prisavkastningen är inte totalavkastning; guldterminernas kontraktsbyten kan påverka serien."
+            )
+            macro_table = build_macro_features(df["date"], macro_data).tail(10).set_index("date")
+            return_columns = [column for column in MACRO_FEATURE_COLUMNS if "_return_" in column]
+            macro_table[return_columns] *= 100
+            macro_table = macro_table.rename(columns={
+                column: f"{column} ({'procentenheter' if '_change_' in column else '%'})"
+                for column in MACRO_FEATURE_COLUMNS
+            })
+            st.dataframe(macro_table.sort_index(ascending=False), width="stretch")
+    except Exception as error:
+        st.warning(f"Makroprognosen kunde inte visas: {error}")
+        st.caption("Bitcoin-modellen ovan påverkas inte. Kontrollera anslutningen och välj Uppdatera makrodata för att försöka igen.")
+
+
+def main() -> None:
+    st.set_page_config(page_title="Bitcoin – pris & prognos", layout="wide")
+    st.title("Bitcoin – historik och prognos")
+
+    show_data_controls()
 
     method = st.segmented_control(
         "AI-metod",
@@ -411,143 +574,12 @@ def main():
         width="stretch",
     )
 
-    with st.expander("Om modellen"):
-        relative_rmse_text = format_optional_pct(metrics.get("relative_price_rmse_pct"))
-        margin_text = format_optional_pct(metrics.get("historical_margin_pct"), prefix="±")
-        if metrics["tuned"]:
-            methodology = f"""
-            **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
-            om {weeks_ahead} veckor?") med en kronologisk **tränings-/validerings-/test**-
-            uppdelning: {metrics['n_train']} tränings-, {metrics['n_val']} validerings- och
-            {metrics['n_test']} testexempel (äldst → nyast).
+    show_model_details(method, horizon_label, weeks_ahead, metrics, all_metrics)
 
-            1. Ett par hyperparameter-kandidater tränas på träningsdelen och jämförs på
-               valideringsdelen – bästa valet: `{metrics['best_params'] or "standardvärden"}`
-               (val-RMSE: {metrics['val_rmse']:.1f}).
-            2. Den valda konfigurationen tränas om på träning+validering inom vald historiklängd och testas en
-               **enda gång** på den helt osedda testdelen – det är detta som rapporteras
-               nedan som modellens riktiga prestanda.
-            3. Den modell som faktiskt gör prognosen ovan tränas därefter om en sista gång
-               på kompletta exempel inom **vald historiklängd**. Testutfallen ingår först
-               efter utvärderingen.
-            """
-        else:
-            methodology = f"""
-            **{method}** tränad direkt mot horisonten **{horizon_label}** ("vad blir priset
-            om {weeks_ahead} veckor?"). Vår ~16-åriga historik räcker inte till tre helt
-            separata, läckagefria fönster vid så här lång horisont (varje fönster behöver
-            egen marginal på minst {weeks_ahead} veckor) – appen föll därför tillbaka på en
-            enklare uppdelning: {metrics['n_train']} tränings- och {metrics['n_test']}
-            testexempel (äldst → nyast), med metodens standardhyperparametrar (ingen
-            validerings-tuning för den här horisonten).
-            """
-        st.write(
-            methodology
-            + f"""
-            **Testresultat (helt osedd data):**
-            - MAE: {metrics['mae']:.1f} (naiv baseline, dvs. "priset om {weeks_ahead} veckor
-              = samma som nu": {metrics['naive_mae']:.1f})
-            - RMSE: {metrics['rmse']:.1f} (naiv baseline: {metrics['naive_rmse']:.1f})
-            - Relativ RMSE på intervallets kalibreringsdel: {relative_rmse_text}
-            - Kalibrerad 80 %-marginal: {margin_text}
-            - R²: {metrics['r2']:.3f}
-
-            Detta är en proof of concept – flödet (data → databas → AI-modell → frontend)
-            är det viktiga, inte modellens exakta träffsäkerhet.
-
-            Varje horisont (1 månad, 3 månader, ..., 5 år) har en egen modell som tränas
-            direkt mot faktiska historiska N-veckors-förändringar, istället för att kedja
-            ihop upprepade enveckasprognoser. Det ger en mer statistiskt rimlig prognos,
-            men ju längre horisont desto färre historiska exempel finns att träna på och
-            desto osäkrare är prognosen – en 5-årsprognos ska ses som en illustration av
-            flödet, inte som en tillförlitlig prisprognos.
-            """
-        )
-
-        st.write("**Jämförelse mellan metoder (relativ RMSE, lägre är bättre):**")
-        comparison = pd.DataFrame(
-            [{
-                "Metod": m,
-                "Relativ RMSE (%)": all_metrics[m].get("relative_price_rmse_pct"),
-                "RMSE (USD)": all_metrics[m]["rmse"],
-                "MAE (USD)": all_metrics[m]["mae"],
-            } for m in METHODS]
-        ).sort_values("Relativ RMSE (%)", na_position="last")
-        st.dataframe(comparison.set_index("Metod"), width="stretch")
-
-    st.subheader(f"Bitcoin + makro – {method} ({horizon_label} framåt)")
-    st.caption("Separat Bitcoin-prognos: samtliga Bitcoin-features + S&P 500, guld och amerikansk tioårsränta.")
-    if st.button("Uppdatera makrodata"):
-        get_macro_data.clear()
-        get_macro_model_and_metrics.clear()
-
-    try:
-        with st.spinner("Hämtar makrodata och tränar Bitcoin + makro…"):
-            macro_data = get_macro_data((df["date"].min() - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
-            all_macro_results = {
-                name: get_macro_model_and_metrics(name, weeks_ahead, df, macro_data)
-                for name in METHODS
-            }
-            macro_model, macro_metrics = all_macro_results[method]
-            macro_price = predict_price(inference_df, macro_model, horizon_weeks=weeks_ahead, macro_df=macro_data)
-        all_macro_metrics = {name: result[1] for name, result in all_macro_results.items()}
-        show_best_method(all_macro_metrics, method, "Bitcoin + makro")
-        macro_prediction_is_valid = is_nonnegative_finite(macro_price)
-        if macro_prediction_is_valid:
-            macro_change_pct = (macro_price / forecast_base_price - 1) * 100
-            st.metric(f"Makroprognos om {horizon_label}", f"{macro_price:,.0f} USD", f"{macro_change_pct:+.1f}%")
-            if macro_price == 0:
-                st.warning(
-                    f"Bitcoin + makro med {method} gav en rå prisprognos på 0 USD eller lägre för "
-                    f"{horizon_label}. Prognosen visas därför med golvet 0 USD; något procentbaserat "
-                    "prisintervall kan inte beräknas runt 0."
-                )
-        else:
-            st.metric(f"Makroprognos om {horizon_label}", "Ej giltig")
-            st.warning(
-                f"Bitcoin + makro med {method} gav en icke ändlig prisprognos för {horizon_label}. "
-                "Prognosen visas därför inte."
-            )
-        show_historical_margin(macro_price, macro_metrics)
-        show_evaluation(macro_metrics)
-        macro_fig = forecast_chart(
-            df, macro_price, forecast_origin_date, forecast_date, forecast_base_price,
-            price_label="Bitcoin-pris", forecast_label="Prognos: Bitcoin + makro",
-        )
-        st.plotly_chart(macro_fig, width="stretch")
-        with st.popover("ℹ️ Information om makromodellen"):
-            st.write(
-                f"MAE: {macro_metrics['mae']:,.0f} USD. "
-                f"Hyperparametertuning: {'ja' if macro_metrics['tuned'] else 'nej, för kort historik'}."
-            )
-            if macro_metrics["test_dates"] == metrics["test_dates"]:
-                st.write("Bitcoin- och makromodellen utvärderas på samma testdatum.")
-        if macro_metrics["test_dates"] != metrics["test_dates"]:
-            st.warning("Modellerna har olika testdatum på grund av datatäckningen. Deras RMSE är inte direkt jämförbara.")
-        with st.expander("Makrofaktorer och enheter"):
-            st.write(
-                "S&P 500 och guld: 12- och 52-veckors prisavkastning (decimalform i modellen, % nedan). "
-                "Tioårsränta: nivå i % och 12-veckors förändring i procentenheter, inte obligationsavkastning. "
-                "Grafen visar prognostiserat Bitcoin-pris i USD; prognosens avkastning visas ovan. "
-                "Inga framtida makrovärden matas in. Saknad eller mer än sju dagar gammal data fylls inte bakåt."
-            )
-            st.markdown(
-                "Källor: Yahoo Finance [S&P 500 (^GSPC)](https://finance.yahoo.com/quote/%5EGSPC/), "
-                "[guldterminer (GC=F)](https://finance.yahoo.com/quote/GC%3DF/) som guldproxy, "
-                "[tioårsränta (^TNX)](https://finance.yahoo.com/quote/%5ETNX/). "
-                "Prisavkastningen är inte totalavkastning; guldterminernas kontraktsbyten kan påverka serien."
-            )
-            macro_table = build_macro_features(df["date"], macro_data).tail(10).set_index("date")
-            return_columns = [column for column in MACRO_FEATURE_COLUMNS if "_return_" in column]
-            macro_table[return_columns] *= 100
-            macro_table = macro_table.rename(columns={
-                column: f"{column} ({'procentenheter' if '_change_' in column else '%'})"
-                for column in MACRO_FEATURE_COLUMNS
-            })
-            st.dataframe(macro_table.sort_index(ascending=False), width="stretch")
-    except Exception as error:
-        st.warning(f"Makroprognosen kunde inte visas: {error}")
-        st.caption("Bitcoin-modellen ovan påverkas inte. Kontrollera anslutningen och välj Uppdatera makrodata för att försöka igen.")
+    show_macro_forecast(
+        df, inference_df, method, horizon_label, metrics,
+        forecast_origin_date, forecast_base_price,
+    )
 
 
 if __name__ == "__main__":

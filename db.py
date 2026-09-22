@@ -64,8 +64,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
             conn.execute("ALTER TABLE prices RENAME TO prices_old")
             conn.execute(schema_sql)
 
-            old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
-            copy_columns = [column for column in ["date", "price", "pct_change", "volume"] if column in old_columns]
+            old_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(prices_old)")
+            }
+            copy_columns = [
+                column
+                for column in ["date", "price", "pct_change", "volume"]
+                if column in old_columns
+            ]
             if copy_columns:
                 columns_sql = ", ".join(copy_columns)
                 conn.execute(
@@ -77,7 +83,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
                     """
                 )
             conn.execute("DROP TABLE prices_old")
-        current_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices)").fetchall()}
+        current_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices)")}
         if current_columns and "volume" not in current_columns:
             conn.execute("ALTER TABLE prices ADD COLUMN volume REAL")
 
@@ -95,8 +101,7 @@ def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
     init_db(db_path)
     with closing(sqlite3.connect(db_path)) as conn:
         conn.execute("DELETE FROM prices")
-        df = df.assign(volume=None)
-        df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_sql(
+        df.assign(volume=None, date=df["date"].dt.strftime("%Y-%m-%d")).to_sql(
             "prices", conn, if_exists="append", index=False
         )
         conn.commit()
@@ -111,7 +116,9 @@ def fetch_live_prices(start: str = "2011-09-15", interval: str = "1wk") -> pd.Da
     if interval != "1wk":
         raise ValueError("Modellen kräver veckodata (interval='1wk').")
     # Dagliga stängningspriser ger gemensamma söndagsdatum med CSV-filen.
-    raw = yf.download("BTC-USD", start=start, interval="1d", progress=False, auto_adjust=False)
+    raw = yf.download(
+        "BTC-USD", start=start, interval="1d", progress=False, auto_adjust=False
+    )
     if raw.empty:
         raise RuntimeError("Yahoo Finance returnerade inga priser. Kontrollera anslutningen och försök igen.")
 
@@ -121,13 +128,18 @@ def fetch_live_prices(start: str = "2011-09-15", interval: str = "1wk") -> pd.Da
 
     raw["Volume"] = pd.to_numeric(raw["Volume"], errors="coerce") if "Volume" in raw else np.nan
     raw["weekly_volume"] = raw["Volume"].rolling(7, min_periods=7).sum()
-    df = raw.rename(columns={"Date": "date", "Close": "price"})[["date", "price", "weekly_volume"]]
+    df = raw.rename(
+        columns={"Date": "date", "Close": "price", "weekly_volume": "volume"}
+    )[["date", "price", "volume"]]
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     today = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
     df = df.loc[df["date"] < today].dropna(subset=["price"])
     # Ta endast faktiska söndagsstängningar; fyll inte luckor med äldre priser.
-    df = df.loc[df["date"].dt.dayofweek == 6].sort_values("date").reset_index(drop=True)
-    df = df.rename(columns={"weekly_volume": "volume"})
+    df = (
+        df.loc[df["date"].dt.dayofweek == 6]
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
     if df.empty:
         raise RuntimeError("Yahoo Finance returnerade inga avslutade söndagspriser.")
     df["pct_change"] = df["price"].pct_change(fill_method=None) * 100
@@ -168,8 +180,7 @@ def load_prices_df(db_path: Path = DB_PATH) -> pd.DataFrame:
     if not db_path.exists():
         ingest_csv(db_path=db_path)
     with closing(sqlite3.connect(db_path)) as conn:
-        df = pd.read_sql("SELECT * FROM prices ORDER BY date", conn, parse_dates=["date"])
-    return df
+        return pd.read_sql("SELECT * FROM prices ORDER BY date", conn, parse_dates=["date"])
 
 
 if __name__ == "__main__":
