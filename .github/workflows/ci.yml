@@ -22,10 +22,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pytest
+          python -m pip install -r requirements.txt
 
       - name: Compile Python files
-        run: python -m compileall app.py db.py model.py
+        run: python -m compileall app.py db.py macro.py model.py
 
       - name: Build SQLite database from CSV
         run: python db.py
@@ -33,11 +33,5 @@ jobs:
       - name: Train model smoke test
         run: python model.py
 
-      - name: Run tests when present
-        shell: bash
-        run: |
-          if [ -d tests ]; then
-            python -m pytest
-          else
-            echo "No tests directory yet; skipping pytest."
-          fi
+      - name: Run tests
+        run: python -m pytest

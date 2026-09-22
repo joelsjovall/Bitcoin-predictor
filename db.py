@@ -1,9 +1,10 @@
 """Backend: läser in CSV-datan och lagrar den i en SQLite-databas."""
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 DB_PATH = Path(__file__).parent / "bitcoin.db"
 CSV_PATH = Path(__file__).parent / "Bitcoin Empirisk data.csv"
@@ -36,52 +37,51 @@ def load_csv(csv_path: Path = CSV_PATH) -> pd.DataFrame:
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Skapar prices-tabellen (date, price, pct_change).
+    """Skapar pristabellen med datum, pris, prisförändring och volym.
 
     Migrerar en äldre tabell som saknar PRIMARY KEY på date (behövs för
     ON CONFLICT i ingest_live()) genom att bygga om den och kopiera över datan.
     """
-    conn = sqlite3.connect(db_path)
-    schema_sql = """
-        CREATE TABLE prices (
-            date TEXT PRIMARY KEY,
-            price REAL,
-            pct_change REAL
-            ,volume REAL
-        )
-        """
-    table_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prices'"
-    ).fetchone()
-
-    if not table_exists:
-        conn.execute(schema_sql)
-
-    table_info = conn.execute("PRAGMA table_info(prices)").fetchall()
-    has_date_primary_key = any(row[1] == "date" and row[5] for row in table_info)
-    if table_info and not has_date_primary_key:
-        conn.execute("ALTER TABLE prices RENAME TO prices_old")
-        conn.execute(schema_sql)
-
-        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
-        copy_columns = [column for column in ["date", "price", "pct_change", "volume"] if column in old_columns]
-        if copy_columns:
-            columns_sql = ", ".join(copy_columns)
-            conn.execute(
-                f"""
-                INSERT OR REPLACE INTO prices ({columns_sql})
-                SELECT {columns_sql}
-                FROM prices_old
-                WHERE date IS NOT NULL
-                """
+    with closing(sqlite3.connect(db_path)) as conn:
+        schema_sql = """
+            CREATE TABLE prices (
+                date TEXT PRIMARY KEY,
+                price REAL,
+                pct_change REAL,
+                volume REAL
             )
-        conn.execute("DROP TABLE prices_old")
-    current_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices)").fetchall()}
-    if current_columns and "volume" not in current_columns:
-        conn.execute("ALTER TABLE prices ADD COLUMN volume REAL")
+            """
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prices'"
+        ).fetchone()
 
-    conn.commit()
-    conn.close()
+        if not table_exists:
+            conn.execute(schema_sql)
+
+        table_info = conn.execute("PRAGMA table_info(prices)").fetchall()
+        has_date_primary_key = any(row[1] == "date" and row[5] for row in table_info)
+        if table_info and not has_date_primary_key:
+            conn.execute("ALTER TABLE prices RENAME TO prices_old")
+            conn.execute(schema_sql)
+
+            old_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices_old)").fetchall()}
+            copy_columns = [column for column in ["date", "price", "pct_change", "volume"] if column in old_columns]
+            if copy_columns:
+                columns_sql = ", ".join(copy_columns)
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO prices ({columns_sql})
+                    SELECT {columns_sql}
+                    FROM prices_old
+                    WHERE date IS NOT NULL
+                    """
+                )
+            conn.execute("DROP TABLE prices_old")
+        current_columns = {row[1] for row in conn.execute("PRAGMA table_info(prices)").fetchall()}
+        if current_columns and "volume" not in current_columns:
+            conn.execute("ALTER TABLE prices ADD COLUMN volume REAL")
+
+        conn.commit()
 
 
 def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
@@ -93,14 +93,13 @@ def ingest_csv(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH) -> int:
     """
     df = load_csv(csv_path)
     init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("DELETE FROM prices")
-    df = df.assign(volume=None)
-    df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_sql(
-        "prices", conn, if_exists="append", index=False
-    )
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("DELETE FROM prices")
+        df = df.assign(volume=None)
+        df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_sql(
+            "prices", conn, if_exists="append", index=False
+        )
+        conn.commit()
     return len(df)
 
 
@@ -146,31 +145,30 @@ def ingest_live(db_path: Path = DB_PATH, start: str = "2011-09-15", interval: st
         raise ValueError("Live-data måste vara söndagsdaterad veckodata (samma vecko-cykel som CSV-historiken).")
 
     init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
-    for row in rows:
-        row.setdefault("volume", None)
-    conn.executemany(
-        """
-        INSERT INTO prices (date, price, pct_change, volume)
-        VALUES (:date, :price, :pct_change, :volume)
-        ON CONFLICT(date) DO UPDATE SET
-            price=excluded.price, pct_change=excluded.pct_change
-            ,volume=excluded.volume
-        """,
-        rows,
-    )
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(db_path)) as conn:
+        rows = df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
+        for row in rows:
+            row.setdefault("volume", None)
+        conn.executemany(
+            """
+            INSERT INTO prices (date, price, pct_change, volume)
+            VALUES (:date, :price, :pct_change, :volume)
+            ON CONFLICT(date) DO UPDATE SET
+                price=excluded.price,
+                pct_change=excluded.pct_change,
+                volume=excluded.volume
+            """,
+            rows,
+        )
+        conn.commit()
     return len(rows)
 
 
 def load_prices_df(db_path: Path = DB_PATH) -> pd.DataFrame:
     if not db_path.exists():
         ingest_csv(db_path=db_path)
-    conn = sqlite3.connect(db_path)
-    df = pd.read_sql("SELECT * FROM prices ORDER BY date", conn, parse_dates=["date"])
-    conn.close()
+    with closing(sqlite3.connect(db_path)) as conn:
+        df = pd.read_sql("SELECT * FROM prices ORDER BY date", conn, parse_dates=["date"])
     return df
 
 

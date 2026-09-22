@@ -36,11 +36,8 @@ FEATURE_COLUMNS = [
     "rolling_mean_return_4",
     "rolling_std_return_4",
 ]
-VOLUME_FEATURE_COLUMNS = ["volume_change_4w", "relative_volume_12w"]
 
-# Alla metoder tränas på samma features/target, se build_features(). Features skalas
-# (StandardScaler) eftersom SVR och linjär regression är känsliga för det, medan det är
-# harmlöst för de trädbaserade metoderna.
+# Samma faktorer och skalning används för alla metoder.
 METHODS = {
     "Linjär regression": lambda: make_pipeline(StandardScaler(), LinearRegression()),
     "Ridge": lambda: make_pipeline(StandardScaler(), Ridge()),
@@ -53,9 +50,7 @@ METHODS = {
     ),
 }
 
-# Kandidater för hyperparameter-tuning, ett par per metod. Väljs mot valideringsdelen
-# i train_model() (se där) – hålls medvetet få för att träningstiden inte ska explodera
-# när fyra metoder x flera horisonter tränas om i appen.
+# Parametrar väljs på valideringsdata, aldrig på sluttestet.
 PARAM_GRIDS = {
     "Linjär regression": [{}],
     "Ridge": [
@@ -100,17 +95,27 @@ def _model_path(method: str, horizon_weeks: int, include_macro: bool = False) ->
     return MODEL_DIR / f"{prefix}_{slug}_{horizon_weeks}w.pkl"
 
 
-def build_features(df: pd.DataFrame, horizon_weeks: int = 1, macro_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Bygger features och ett mål `horizon_weeks` veckor framåt.
+def _feature_columns(macro_df: pd.DataFrame | None) -> list[str]:
+    return FEATURE_COLUMNS + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
 
-    df måste innehålla kolumnerna date, price, pct_change och vara sorterad äldst
-    först. Bitcoin-priset har vuxit exponentiellt (från ca 0,1 till 80 000+ USD), så
-    absoluta prisnivåer generaliserar dåligt mellan tränings- och testperiod. Därför
-    byggs features och mål som relativa förändringar (avkastning) istället.
 
-    Modellen tränas direkt mot horisonten (t.ex. "priset om 52 veckor"), inte genom
-    att kedja ihop upprepade enveckasprognoser – det senare får fel att ackumuleras
-    exponentiellt över långa horisonter.
+def _fit_model(method, rows, columns, params=None):
+    model = METHODS[method]()
+    if params:
+        model.set_params(**params)
+    model.fit(rows[columns], rows["target_return"])
+    return model
+
+
+def build_features(
+    df: pd.DataFrame,
+    horizon_weeks: int = 1,
+    macro_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Bygg faktorer och framtida avkastning från date och price.
+
+    Sorterar veckodata och behåller ofullständiga rader för senaste prognosen.
+    Framtida utfall används endast som mål, aldrig som faktorer.
     """
     out = df.copy().sort_values("date").reset_index(drop=True)
     out["date"] = pd.to_datetime(out["date"])
@@ -176,8 +181,7 @@ def _select_configuration(method, train, validation, columns, min_rows=MIN_EVAL_
         if len(selected) < min_rows:
             continue
         for params in PARAM_GRIDS[method]:
-            candidate = METHODS[method]().set_params(**params)
-            candidate.fit(selected[columns], selected["target_return"])
+            candidate = _fit_model(method, selected, columns, params)
             score = _price_rmse(validation, candidate.predict(validation[columns]))
             scores.append({"params": params.copy(), "history_weeks": weeks,
                            "n_train": len(selected), "val_rmse": score})
@@ -245,24 +249,11 @@ def train_model(
     test_size: float = 0.2,
     macro_df: pd.DataFrame | None = None,
 ):
-    """Tränar `method` mot `horizon_weeks` med en kronologisk tränings-/validerings-/
-    testdelning (standard 60/20/20).
+    """Välj konfiguration på valideringsdata och utvärdera på ett separat sluttest.
 
-    1. Ett par hyperparameter-kandidater (se PARAM_GRIDS) tränas på träningsdelen och
-       utvärderas på valideringsdelen – den med lägst val-RMSE vinner.
-    2. De vinnande hyperparametrarna tränas om på träning+validering och utvärderas en
-       enda gång på den helt osedda testdelen – det är detta som rapporteras som
-       modellens riktiga prestanda (mae/rmse/r2 i den returnerade metrics-dicten).
-    3. Den slutliga modellen som faktiskt används för prognoser tränas om en sista gång
-       med samma hyperparametrar men på *all* tillgänglig data (train+val+test), så att
-       den verkliga prognosen får utnyttja så mycket historik som möjligt. Testdelens
-       enda syfte är alltså att ge en ärlig uppskattning av hur bra den modellen är.
-
-    För långa horisonter (t.ex. 5 år) räcker vår ~16-åriga historik inte till tre
-    helt separata, läckagefria fönster (varje fönster behöver egen marginal på minst
-    horizon_weeks rader). Då faller vi tillbaka på en enkel 80/20 train/test-delning
-    med metodens standardhyperparametrar (ingen tuning) – `metrics["tuned"]` visar
-    vilket som skedde.
+    Slutmodellen tränas sedan på kompletta exempel inom vald historiklängd
+    och sparas på disk. Returnerar modellen och utvärderingsmåtten.
+    Om historiken inte räcker för validering används standardparametrar.
     """
     if method not in METHODS:
         raise ValueError(f"Okänd metod: {method}. Välj bland {list(METHODS)}")
@@ -271,10 +262,7 @@ def train_model(
     if not 0 < val_size < 1 or not 0 < test_size < 1 or val_size + test_size >= 1:
         raise ValueError("val_size och test_size måste vara mellan 0 och 1 och summera till mindre än 1.")
 
-    # Volym sparas i databasen men används inte automatiskt: ett jämförande test
-    # visade högre fel med volym på den aktuella testperioden.
-    volume_columns = []
-    feature_columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    feature_columns = _feature_columns(macro_df)
     feat = build_features(df, horizon_weeks, macro_df).dropna(subset=feature_columns + ["target_return"])
     if len(feat) < 3:
         raise ValueError("För lite komplett historik för vald modell och horisont.")
@@ -302,10 +290,7 @@ def train_model(
     # tränas om på train_for_eval och utvärderas en enda gång på den helt osedda testdelen.
     train_for_eval = _training_window(train_for_eval, history_weeks)
     production_rows = _training_window(feat, history_weeks)
-    eval_model = METHODS[method]()
-    if best_params:
-        eval_model.set_params(**best_params)
-    eval_model.fit(train_for_eval[feature_columns], train_for_eval["target_return"])
+    eval_model = _fit_model(method, train_for_eval, feature_columns, best_params)
 
     pred_return = eval_model.predict(test[feature_columns])
     pred_price = test["price"].values * (1 + pred_return)
@@ -344,11 +329,8 @@ def train_model(
         "return_rmse_pct": float(np.sqrt(mean_squared_error(test["target_return"], pred_return)) * 100),
     }
 
-    # Produktionsmodell: samma hyperparametrar, tränad på all tillgänglig data.
-    production_model = METHODS[method]()
-    if best_params:
-        production_model.set_params(**best_params)
-    production_model.fit(production_rows[feature_columns], production_rows["target_return"])
+    # Testutfallen får ingå först efter utvärderingen, inom vald historiklängd.
+    production_model = _fit_model(method, production_rows, feature_columns, best_params)
 
     joblib.dump(production_model, _model_path(method, horizon_weeks, macro_df is not None))
     return production_model, metrics
@@ -373,8 +355,7 @@ def rolling_backtest(
         raise ValueError("Okänd metod.")
     if not isinstance(step_weeks, int) or step_weeks < 1 or min_train_rows < MIN_EVAL_ROWS:
         raise ValueError("Ogiltigt teststeg eller för få träningsexempel.")
-    volume_columns = []
-    columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    columns = _feature_columns(macro_df)
     feat = build_features(df, horizon_weeks, macro_df).dropna(subset=columns + ["target_return"])
     eligible = feat.loc[feat["target_date"] < pd.Timestamp(holdout_start)]
     records = []
@@ -397,8 +378,7 @@ def rolling_backtest(
                 method, inner_train, validation, columns, min_train_rows
             )
         known = _training_window(known, history_weeks)
-        estimator = METHODS[method]().set_params(**params)
-        estimator.fit(known[columns], known["target_return"])
+        estimator = _fit_model(method, known, columns, params)
         inputs = feat.loc[[row.name], columns]
         predicted_return = float(estimator.predict(inputs)[0])
         records.append({
@@ -445,8 +425,7 @@ def predict_price(
     if model is None:
         model = load_model(method, horizon_weeks, macro_df)
 
-    volume_columns = []
-    feature_columns = FEATURE_COLUMNS + volume_columns + (MACRO_FEATURE_COLUMNS if macro_df is not None else [])
+    feature_columns = _feature_columns(macro_df)
     feat = build_features(df, horizon_weeks, macro_df)
     latest = feat.iloc[[-1]]
     if latest[feature_columns].isna().any().any():

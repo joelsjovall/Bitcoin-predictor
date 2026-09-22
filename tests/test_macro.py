@@ -129,6 +129,10 @@ def test_app_keeps_bitcoin_chart_and_handles_macro_result(tmp_path, monkeypatch,
     monkeypatch.setattr(model_module, "METHODS", {"Random Forest": model_module.METHODS["Linjär regression"]})
     monkeypatch.setitem(model_module.PARAM_GRIDS, "Random Forest", [{}])
     monkeypatch.setattr("db.load_prices_df", lambda: bitcoin)
+    # Appens automatiska uppdatering får inte skriva till den riktiga databasen.
+    monkeypatch.setattr("db.ingest_live", lambda: 0)
+    daily_price = pd.DataFrame({"Close": [30_000.0]})
+    monkeypatch.setattr("yfinance.download", lambda *args, **kwargs: daily_price.copy())
 
     def download(start):
         if download_fails:
@@ -142,6 +146,7 @@ def test_app_keeps_bitcoin_chart_and_handles_macro_result(tmp_path, monkeypatch,
         app = AppTest.from_file("../app.py")
         app.run(timeout=30)
         assert not app.exception
+        assert any(metric.value == "30,000" for metric in app.metric)
         assert not any("avkastning i procentenheter" in metric.label for metric in app.metric)
         assert len(app.get("plotly_chart")) == (2 if download_fails else 4)
         assert any(metric.label == "RMSE (rullande, USD)" for metric in app.metric)
@@ -151,6 +156,11 @@ def test_app_keeps_bitcoin_chart_and_handles_macro_result(tmp_path, monkeypatch,
             assert any("Makroprognos" in metric.label for metric in app.metric)
             labels = [metric.label for metric in app.metric]
             assert labels.count("RMSE (test, USD)") == 2
+
+        retrain = next(button for button in app.button if button.label == "Träna om modellen")
+        retrain.click().run(timeout=30)
+        assert not app.exception
+        assert len(app.get("plotly_chart")) == (2 if download_fails else 4)
     finally:
         st.cache_data.clear()
         st.cache_resource.clear()
