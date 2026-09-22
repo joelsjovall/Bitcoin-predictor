@@ -148,19 +148,22 @@ def test_app_keeps_bitcoin_chart_and_handles_macro_result(tmp_path, monkeypatch,
         assert not app.exception
         assert any(metric.value == "30,000" for metric in app.metric)
         assert not any("avkastning i procentenheter" in metric.label for metric in app.metric)
-        assert len(app.get("plotly_chart")) == (2 if download_fails else 4)
-        assert any(metric.label == "RMSE (rullande, USD)" for metric in app.metric)
+        status_messages = [element.value for element in [*app.success, *app.info]]
+        assert not any("🏆" in message for message in status_messages)
+        expected_rankings = 1 if download_fails else 2
+        assert sum("bästa metoden för" in message.lower() for message in status_messages) == expected_rankings
+        assert len(app.get("plotly_chart")) == (1 if download_fails else 2)
         if download_fails:
             assert any("Test: offline" in warning.value for warning in app.warning)
         else:
             assert any("Makroprognos" in metric.label for metric in app.metric)
             labels = [metric.label for metric in app.metric]
-            assert labels.count("RMSE (test, USD)") == 2
+            assert labels.count("RMSE (hela sluttestet, USD)") == 2
 
         retrain = next(button for button in app.button if button.label == "Träna om modellen")
         retrain.click().run(timeout=30)
         assert not app.exception
-        assert len(app.get("plotly_chart")) == (2 if download_fails else 4)
+        assert len(app.get("plotly_chart")) == (1 if download_fails else 2)
     finally:
         st.cache_data.clear()
         st.cache_resource.clear()

@@ -1,4 +1,4 @@
-﻿# Bitcoin-predictor
+# Bitcoin-predictor
 
 Utforska Bitcoins prishistorik och jämför hur olika maskininlärningsmodeller bedömer framtida priser — direkt i webbläsaren.
 
@@ -73,7 +73,9 @@ Du behöver bara installera beroenden och importera CSV-filen första gången. *
 
 Med **Hämta senaste data (live)** uppdaterar du Bitcoin-priserna. **Uppdatera makrodata** hämtar nya makrodata, och **Träna om modellen** räknar om resultaten.
 
-Prognosen utgår från det senaste veckopriset. Det dagliga pris som visas separat kan därför skilja sig från prognosens startpris.
+När dagspriset kan hämtas används det som utgångspunkt för den aktuella prognosen. Träning och historiska tester använder fortfarande veckopriserna. Om dagspriset saknas utgår prognosen från senaste veckopriset.
+
+Appens markering av bästa metod bygger på relativ RMSE. Prisintervallet bygger på historiska fel, med en separat kontroll på senare utfall när underlaget räcker.
 
 ## Bra att veta
 
