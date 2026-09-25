@@ -76,15 +76,18 @@ def test_historical_margin_does_not_silently_exclude_invalid_predictions(predict
     assert model_module.historical_price_margin([100, 100], predictions) is None
 
 
-def test_predict_price_returns_positive_float(tmp_path, monkeypatch):
+@pytest.mark.parametrize("method", model_module.METHODS)
+def test_predict_price_returns_positive_float(tmp_path, monkeypatch, method):
     monkeypatch.setattr(model_module, "MODEL_DIR", tmp_path)
     df = make_price_frame()
-    trained_model, _ = train_model(df, val_size=0.2, test_size=0.2)
+    trained_model, _ = train_model(df, method=method, val_size=0.2, test_size=0.2)
 
     prediction = predict_price(df, trained_model)
 
     assert isinstance(prediction, float)
     assert prediction > 0
+    loaded = model_module.load_model(method)
+    assert predict_price(df, loaded) == pytest.approx(prediction)
 
 
 def test_latest_live_price_is_used_only_in_inference_copy():

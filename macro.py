@@ -37,21 +37,33 @@ def fetch_macro_prices(start: str) -> pd.DataFrame:
 
 
 def build_macro_features(dates: pd.Series, macro_df: pd.DataFrame) -> pd.DataFrame:
-    weekly = pd.DataFrame({"date": pd.to_datetime(dates)}).sort_values("date").reset_index(drop=True)
+    weekly = (
+        pd.DataFrame({"date": pd.to_datetime(dates)})
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
     weekly["date"] = weekly["date"].dt.tz_localize(None).astype("datetime64[ns]")
     if not weekly["date"].diff().dropna().eq(pd.Timedelta(weeks=1)).all():
         raise ValueError("Makrofaktorer kräver sammanhängande veckodatum.")
     for column in MACRO_TICKERS:
         observations = macro_df[["date", column]].copy()
-        observations["date"] = pd.to_datetime(observations["date"]).dt.tz_localize(None).astype("datetime64[ns]")
+        observations["date"] = (
+            pd.to_datetime(observations["date"])
+            .dt.tz_localize(None)
+            .astype("datetime64[ns]")
+        )
         observations[column] = pd.to_numeric(observations[column], errors="coerce")
         observations = observations.replace([np.inf, -np.inf], np.nan).dropna()
         if column != "treasury_10y":
             observations = observations.loc[observations[column] > 0]
         observations = observations.sort_values("date").drop_duplicates("date", keep="last")
         weekly[column] = pd.merge_asof(
-            weekly[["date"]], observations, on="date", direction="backward",
-            tolerance=pd.Timedelta(days=7), allow_exact_matches=False,
+            weekly[["date"]],
+            observations,
+            on="date",
+            direction="backward",
+            tolerance=pd.Timedelta(days=7),
+            allow_exact_matches=False,
         )[column]
     for asset in ("sp500", "gold"):
         for weeks in (12, 52):
