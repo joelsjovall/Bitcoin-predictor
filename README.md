@@ -11,7 +11,7 @@ Appen visar två perspektiv: en prognos baserad på Bitcoins historik och en som
 - Välja prognoser från en månad till fem år.
 - Se hur modellerna har presterat historiskt, jämfört med att priset hade varit oförändrat.
 
-Byggt med **Python, Streamlit, Plotly och SQLite**. All träning och lagring sker lokalt. Pris- och makrodata hämtas via Yahoo Finance, och Bitcoin-historik följer med som CSV.
+Byggt med **Python, Streamlit, och Plotly**. All träning och lagring sker lokalt. Pris- och makrodata hämtas via Yahoo Finance, och Bitcoin-historik följer med som CSV.
 
 ## Kom igång
 
